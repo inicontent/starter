@@ -1,4 +1,4 @@
-# Nuxt Minimal Starter
+# Inicontent Minimal Starter
 
 Look at the [Nuxt documentation](https://nuxt.com/docs/getting-started/introduction) to learn more.
 
@@ -22,7 +22,7 @@ bun install
 
 ## Development Server
 
-Start the development server on `http://localhost:3000`:
+Start the development server on `http://localhost:3434`:
 
 ```bash
 # npm
