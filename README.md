@@ -1,6 +1,15 @@
-# Inicontent Minimal Starter
+# Inicontent Starter
 
-Look at the [Nuxt documentation](https://nuxt.com/docs/getting-started/introduction) to learn more.
+A minimal [Nuxt 4](https://nuxt.com/docs/getting-started/introduction) app whose only job is to
+mount the **[Inicontent CMS](https://github.com/inicontent/inicontent)** as a Nuxt layer. It gives
+you, out of the box:
+
+- The full CMS admin UI — table grids, item forms, flows, settings, API docs (`/admin`).
+- A per-database **REST API** served at `https://api.inicontent.com/{databaseSlug}/{table}`
+  (authenticate with `PUT {databaseSlug}/auth/signin`, then pass the `{databaseSlug}_sid` session).
+- A place for your own pages under `pages/` that **override** the CMS routes.
+- **[`CONTEXT.md`](CONTEXT.md)** — the AI-agent build context: authentication, REST API,
+  query language, table schemas & flows, and how to register custom table routes.
 
 ## Setup
 
@@ -19,6 +28,22 @@ yarn install
 # bun
 bun install
 ```
+
+## Configuration (`.env`)
+
+```dotenv
+# REQUIRED — the slug of the database the app manages.
+database=myapp
+
+# OPTIONAL — override the public API base (default https://api.inicontent.com/).
+# apiBase=https://api.inicontent.com/
+
+# OPTIONAL — override the super-admin role id.
+# idOne=d7b3d61a582e53ee29b5a1d02a436d55
+```
+
+- With `database` set, the admin interface opens the tables of that DB directly at `/admin`.
+- Without it, `/admin` lists all available databases, and each DB's admin lives at `/{db}/admin`.
 
 ## Development Server
 
@@ -72,4 +97,13 @@ yarn preview
 bun run preview
 ```
 
-Check out the [deployment documentation](https://nuxt.com/docs/getting-started/deployment) for more information.
+## Building your app on top of the layer
+
+- **Remove `app.vue`** — the layer provides its own.
+- Add your own files under `pages/`: they **override** the CMS routes of the same name.
+- Per-table screens are **not auto-discovered** from `pages/` — register every custom table route
+  explicitly in `nuxt.config.ts` via `hooks["pages:extend"]` (see `CONTEXT.md` §11).
+- Reusable code goes in `components/`, `composables/`, `layouts/` as in any Nuxt app.
+- **Read [`CONTEXT.md`](CONTEXT.md) before building** — it documents authentication, the REST API,
+  the Inison query language, table schemas, flows, and the route-registration rules the AI and
+  developers must follow.
