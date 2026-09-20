@@ -1,8 +1,8 @@
 # Inicontent Starter
 
 A minimal [Nuxt 4](https://nuxt.com/docs/getting-started/introduction) app whose only job is to
-mount the **[Inicontent CMS](https://github.com/inicontent/inicontent)** as a Nuxt layer. It gives
-you, out of the box:
+mount the **[Inicontent CMS](https://www.npmjs.com/package/inicontent)** as a Nuxt layer —
+installed from the `inicontent` npm package. It gives you, out of the box:
 
 - The full CMS admin UI — table grids, item forms, flows, settings, API docs (`/admin`).
 - A per-database **REST API** served at `https://api.inicontent.com/{databaseSlug}/{table}`
@@ -99,6 +99,8 @@ bun run preview
 
 ## Building your app on top of the layer
 
+- The CMS layer comes from the `inicontent` npm package; `package.json` pins the version
+  (e.g. `^1.0.0`), and `pnpm up inicontent` pulls newer releases.
 - **Remove `app.vue`** — the layer provides its own.
 - Add your own files under `pages/`: they **override** the CMS routes of the same name.
 - Per-table screens are **not auto-discovered** from `pages/` — register every custom table route

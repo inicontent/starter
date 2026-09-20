@@ -44,21 +44,18 @@ Key concepts:
 
 ## 2. The starter project (`github.com/inicontent/starter`)
 
-The starter is a minimal Nuxt app whose only job is to mount the Inicontent layer.
+The starter is a minimal Nuxt app whose only job is to mount the Inicontent layer from the
+[`inicontent` npm package](https://www.npmjs.com/package/inicontent).
 
 Its `nuxt.config.ts`:
 ```ts
 export default defineNuxtConfig({
   compatibilityDate: 'latest',
-  extends: [
-    useLocalInicontent
-      ? resolve(dirname(fileURLToPath(import.meta.url)), "../inicontent")
-      : ["github:inicontent/inicontent", { install: true }],
-  ],
+  extends: ["inicontent"],
 })
 ```
-- If a sibling folder `../inicontent` exists (a local clone of the CMS), it is used — good for local development.
-- Otherwise it pulls the published `inicontent/inicontent` layer from GitHub.
+- The layer is resolved from the `inicontent` version pinned in `package.json` (start with `^1.0.0`).
+- Upgrading to a new CMS release is `pnpm up inicontent` (or `npm update inicontent`) followed by a rebuild.
 
 ### Setup & run
 
@@ -662,21 +659,9 @@ alone**. You must **register every new route explicitly** inside `hooks["pages:e
 route objects into Nuxt's `pages` array.
 
 ```ts
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
-
-const useLocalInicontent = existsSync(
-  resolve(dirname(fileURLToPath(import.meta.url)), "../inicontent"),
-);
-
 export default defineNuxtConfig({
   compatibilityDate: "latest",
-  extends: [
-    useLocalInicontent
-      ? resolve(dirname(fileURLToPath(import.meta.url)), "../inicontent")
-      : ["github:inicontent/inicontent", { install: true }],
-  ],
+  extends: ["inicontent"],
   hooks: {
     "pages:extend"(pages) {
       pages.push(
@@ -814,7 +799,7 @@ export default defineNuxtConfig({
 - Custom table interfaces must be registered in `nuxt.config.ts` via `pages:extend` (§11).
 - When editing a table's schema or flows, send the **full** lists (merge first) — a partial `schema`
   replaces the whole column set, a partial `onRequest`/`onResponse` replaces all flows (§7.4, §8.5).
-- Version: this context targets Nuxt 4 / Inicontent layer from `github:inicontent/inicontent` (current generation).
+- Version: this context targets Nuxt 4 / Inicontent layer from the `inicontent` npm package (current generation).
 
 ---
 
@@ -833,7 +818,6 @@ export default defineNuxtConfig({
 | Flow rule seems ignored | a false condition aborts the flow; `[null,null,null]` is a no-op; check field ids/keys against the schema (§8) |
 | `PUT {db}/ai/tables` → 403 | applying AI tables requires the DB owner/admin role (`idOne`) |
 | Arabic/spaced slugs 404 | push entries verbatim — do not URL-encode the `path`/`name`; encode only when navigating via links |
-| Local dev runs, prod build pulls layer twice | ensure exactly one `extends` entry resolves (local `../inicontent` folder overrides GitHub source) |
 | Port 3434 already in use | `pnpm dev` binds 3434 by design (INIc binary); stop the other process |
 | RSS of session cookie missing in browser | the SPA stores `{db}_sid` per database; check that cookie on API calls from `$fetch` |
 
