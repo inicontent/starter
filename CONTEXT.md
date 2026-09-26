@@ -3,6 +3,9 @@
 > Purpose: give an AI agent everything it needs to build apps on top of **Inicontent CMS**
 > using the **[inicontent/starter](https://github.com/inicontent/starter)** project, including
 > authenticated access to the user's database through the Inicontent REST API.
+>
+> Verified against `inicontent` **1.0.7** (layer), `inibase` **3.3+** (engine, computed fields),
+> and the current public API.
 
 ---
 
@@ -20,7 +23,7 @@ Stack and key libraries:
 | Admin UI components | Naive UI |
 | Icons | Tabler Icons (`tabler:*`) |
 | Rich text editor | Tiptap |
-| Database engine | `inibase` (file-based, ACID, relational) |
+| Database engine | `inibase` (file-based, ACID, relational) — **3.3+** for computed fields |
 | HTTPS public API | `https://api.inicontent.com/` |
 | Query serialization | `inison` (compact string format used for `options` param) |
 
@@ -32,12 +35,20 @@ Key concepts:
 - **Field / Schema** — the column/type definition of a table (string, number, email, password, table ref, arrays, objects, dates…).
 - **Item / Row** — a single record in a table. Every item has an `id` and often `createdBy`, timestamps, etc.
 - **Roles** — each user has a `role` id. The **super-admin role id** is `idOne`
-  (default `d7b3d61a582e53ee29b5a1d02a436d55`); it gates dashboard/role-management features.
+  (default `d7b3d61a582e53ee29b5a1d02a436d55`); it gates dashboard/role-management features **and every AI endpoint**.
 - **allowedMethods** — per-table permission string; letters `r` (read), `c` (create), `u` (update), `d` (delete).
   Respect it: a table with `allowedMethods: "r"` is read-only.
-- **System tables** — almost every DB ships with `users`, `assets`, `translations`, `sessions`, `pages`, `blocks`, `templates`.
+- **System tables** — a new database ships with `users`, `sessions`, `assets`, `translations`, `pages`,
+  `blocks`, `dashboards`, `passkey_credentials`, `passkey_challenges`, `templates`, `backups`.
+  Some are protected (`show: false` or admin-only flows): never rename or delete them.
 - **Flows** — per-table automation stored on the table as `onRequest`/`onResponse` rule arrays
-  (validate/mutate incoming data or query filters, abort with an error, send emails) — see §8.
+  (validate/mutate incoming data or query filters, abort with an error, send emails) — see §9.
+- **Computed fields** — columns whose value the **engine derives on every write** from an expression
+  over other fields (`total = sum(5 * 6)`) — see §8.
+- **Dashboards** — saved chart/counter/table widgets stored in the `dashboards` table — see §12.
+- **Backups** — on-demand full/table archives with scoped restore — see §10.5.
+- **Realtime** — per-table WebSocket change feed (`config.realtime`) — see §13.
+- **Content config** — per-table `config.content` declaration that derives SEO artifacts (sitemap/feed/JSON-LD) — see §4.2.
 - **Locale** — the API accepts a `locale` param; supported values: `ar`, `en`, `fr`, `es`.
 
 ---
@@ -54,8 +65,9 @@ export default defineNuxtConfig({
   extends: ["inicontent"],
 })
 ```
-- The layer is resolved from the `inicontent` version pinned in `package.json` (start with `^1.0.0`).
+- The layer is resolved from the `inicontent` version pinned in `package.json` (current generation: **1.0.7**).
 - Upgrading to a new CMS release is `pnpm up inicontent` (or `npm update inicontent`) followed by a rebuild.
+- Pin `^1.0.7` (or newer) to get computed fields, dashboards and the current admin surface.
 
 ### Setup & run
 
@@ -140,7 +152,7 @@ named `{databaseSlug}_sid`.
 
 ### 3.2 Use the session on every data request
 
-For every subsequent API call pass the session as a query parameter:
+For every subsequent API call pass the session as a query parameter (or as the `{dbSlug}_sid` cookie):
 ```
 {databaseSlug}_sid=<sessionID>
 ```
@@ -160,7 +172,7 @@ curl -s "https://api.inicontent.com/myapp/articles?myapp_sid=<session-id>&option
 ```
 GET https://api.inicontent.com/{databaseSlug}/auth/current?isSignedIn=true&{databaseSlug}_sid=<session-id>
 ```
-→ `{ "result": { "id": "...", "username": "...", ... } }` (or empty/401 when invalid).
+→ `{ "result": { "id": "...", "username": "...", ... } }` (or `result: null` when the session is invalid).
 Use this as a cheap "is my session alive?" check.
 
 ### 3.4 Other auth endpoints
@@ -168,11 +180,15 @@ Use this as a cheap "is my session alive?" check.
 | Action | Method & path | Body / notes |
 | --- | --- | --- |
 | Sign up | `POST {apiBase}{db}/users` | Create an item in the `users` table (include a role id, e.g. `b4694ff1f8c483824582c1e2dc75f0f9`). Only when the `users` table `allowedMethods` includes `c`. |
+| Sign out | `GET {apiBase}{db}/auth/signout` | Invalidates the active session and clears the `{db}_sid` cookie. |
 | Request password reset | `POST {apiBase}{db}/auth/reset` | `{ "email": "..." }` → emails a reset link. |
-| Confirm password reset | `POST {apiBase}{db}/auth/reset` | `{ "token": "...", "password": "..." }` |
+| Confirm password reset | `PUT {apiBase}{db}/auth/reset` | `{ "token": "...", "password": "..." }` (min 8 chars) |
 | Passkey sign-in begin | `PUT {apiBase}{db}/auth/passkey/authenticate/begin` | `{ "identifier": "..." }` |
 | Passkey sign-in complete | `PUT {apiBase}{db}/auth/passkey/authenticate/complete` | challenge + `challengeRef` + credential |
 | Passkey register begin/complete | `PUT {apiBase}{db}/auth/passkey/register/begin` & `/complete` | source: `"auth"` |
+
+> The in-app API docs page (`/admin/api/auth`) advertises a `POST /auth/signup` path. **No such route exists** —
+> signup is a `users` table create (`POST {db}/users`), which the built-in users flows gate.
 
 ---
 
@@ -188,7 +204,10 @@ Response `result` (a `Database`) contains:
 - `slug` — database slug
 - `primaryColor`, `primaryDarkColor`
 - `primaryLanguage`, `secondaryLanguages`
+- `domains` — custom domains attached to the database
 - `roles` — `[{ name, id }]`
+- `size` — stored size of the database
+- `email` — SMTP settings (`smtp_host`, `smtp_port`, `smtp_user`, `smtp_pass`, `smtp_secure`, `from_email`, `from_name`)
 - `tables` — array of `Table` objects:
   ```ts
   {
@@ -197,19 +216,65 @@ Response `result` (a `Database`) contains:
     icon?: string;
     allowedMethods?: string;     // "r" | "c" | "u" | "d" | combinations
     schema?: Schema;             // the field list (see §7)
+    onRequest?: FlowType[];      // table automation (see §9)
+    onResponse?: FlowType[];
     columns?: string[];
     displayAs?: "table" | "kanban" | "cards";
     groupBy?: string;
-    show?: boolean;
-    config?: { log?, realtime?, ... };
+    show?: boolean;              // false hides it from the public API list
+    size?: number;
+    config?: {                   // see §4.1
+      log?: boolean;             // create + keep a {table}/logs table (item history)
+      realtime?: boolean;        // broadcast changes over the WebSocket (§13)
+      content?: ContentConfig;   // SEO/publishing declaration (§4.2)
+      cache?: boolean;
+      compression?: boolean;
+      prepend?: boolean;
+      decodeID?: boolean;
+    };
     defaultSearchableColumns?: number[];
     defaultTableColumns?: number[];
+    currentJob?: "export" | "import";   // non-empty while an import/export job is running
   }
   ```
 
 > Note the metadata endpoint lives under the `inicontent` system slug, while data endpoints use the DB slug.
 > - Metadata: `.../inicontent/databases/{db}`
 > - Table data: `.../{db}/{tableSlug}`
+>
+> `GET .../inicontent/databases` (no slug) lists the databases the session can see.
+
+### 4.1 Table `config` keys
+
+| Key | Effect |
+| --- | --- |
+| `log` | `true` creates a companion `{table}/logs` table recording every change of every item (enables `GET {db}/{table}/logs` and `POST {db}/{table}/{id}/revert`, §5.8) |
+| `realtime` | `true` broadcasts create/update/delete over the WebSocket at `wss://{apiHost}/realtime` and adds the `X-Realtime-Enabled: true` response header on reads |
+| `content` | declarative publishing metadata used to derive SEO artifacts (§4.2) |
+| `cache` | trades database size for faster reads |
+| `compression` | shrinks stored data; slower reads |
+| `prepend` | engine-level file layout hint used by internal tables (do not set on app tables) |
+| `decodeID` | engine-level id encoding hint (do not set on app tables) |
+
+### 4.2 `config.content` — publishing / SEO declaration
+
+`config.content` describes *where* a table's content lives so the platform can derive
+`sitemap.xml`, `feed.xml` and per-record JSON-LD without any per-use-case code. It grants **no access**:
+read/write gating stays in the table's `onRequest`/`onResponse` flows.
+
+| Key | Meaning |
+| --- | --- |
+| `path` | URL path template for one record, e.g. `"articles/[slug]"` |
+| `titleField` | column holding the human-readable title |
+| `slugField` | column holding the URL segment (defaults to `slug`) |
+| `bodyField` | column holding the long-form body |
+| `excerptField` | column holding a short summary |
+| `imageField` | column holding the share image (asset or URL) |
+| `dateField` | column holding the publish date |
+| `statusField` / `publishedValue` | column whose value marks a record public, and the value that means published |
+| `sitemap` / `feed` | include this table's records in `sitemap.xml` / `feed.xml` |
+| `noindex` | emit `noindex` for this table's records |
+| `where` | extra filter merged into the record query |
 
 ---
 
@@ -221,19 +286,19 @@ Base pattern for all table operations:
 https://api.inicontent.com/{databaseSlug}/{tableSlug}
 ```
 
-All requests include the session param `{databaseSlug}_sid=<session-id>`.
+All requests include the session param `{databaseSlug}_sid=<session-id>` (or the cookie).
 
 ### 5.1 List items
 
 ```
-GET {apiBase}{db}/{table}?options={page:1,perPage:25,columns:[title],sort:{age:-1}}&where={and:{status:published}}&locale=en&{db}_sid=<sid>
+GET {apiBase}{db}/{table}?options={page:1,perPage:10,columns:[title],sort:{age:-1}}&where={and:{status:published}}&locale=en&{db}_sid=<sid>
 ```
 
 Query params:
 
 | Param | Description |
 | --- | --- |
-| `options` | **Inison-stringified** `{ page, perPage, columns, sort }` — ALL pagination/projection/sorting live here: `page` (1-based), `perPage` (page size; 25 is a safe default), `columns` (array of keys; prefix `!` to exclude), `sort` (a field name, an array, or an object like `{age:-1}`) |
+| `options` | **Inison-stringified** `{ page, perPage, columns, sort }` — ALL pagination/projection/sorting live here: `page` (1-based, default `1`), `perPage` (page size, **default `15`**), `columns` (array of keys; prefix `!` to exclude), `sort` (a field name, an array, or an object like `{age:-1}`) |
 | `where` | **Inison-stringified** Inibase criteria object, e.g. `{and:{status:published,tag:*news}}` (operators & grouping in §6) |
 | `locale` | translation locale: `ar`, `en`, `fr`, `es` |
 | `{db}_sid` | session id |
@@ -241,31 +306,55 @@ Query params:
 > `options` and `where` are serialized with `Inison.stringify(...)` and sent **URL-encoded** in the query string
 > (use `encodeURIComponent`). Inison is a light JSON-like syntax **without quotes**:
 > `{page:1,perPage:25,columns:[title,!password],sort:{age:-1}}` or `{and:{status:published}}`.
-> There is **no separate `page`/`perPage`/`columns`/`sort` query param** — they all live inside `options`.
+>
+> **There is no `page`/`perPage`/`columns`/`sort`/`search` top-level query param** — plain values are ignored.
+> The in-app docs page (`/admin/api/tables/{table}`) still lists `page`, `limit`, `columns` and `search` as
+> top-level params and claims a default of 25; that page is out of date — trust this section.
+> (`limit` in particular is never read; the page size is `options.perPage`.) An unauthenticated request
+> confirms the real defaults: the error body echoes `"options": { "page": 1, "perPage": 15 }`.
 
 Response:
 ```json
 {
   "result": [ /* Item[] */ ],
-  "options": { "page": 1, "perPage": 25, "total": 42 },
-  "message": "...",
-  "code": 200
+  "options": { "page": 1, "perPage": 15, "total": 42 },
+  "message": "",
+  "code": 202
 }
 ```
+Successful reads answer with `code: 202`; the `options` object is the request's `options` merged with the
+engine's page info (`page`, `perPage`, `total`, and `totalPages`).
+
+> **Read the body, not just the HTTP status.** Most JSON endpoints answer
+> `{ result, message, code, options?, where? }`, and **their errors come back with HTTP 200**:
+> ```json
+> { "result": null, "message": "The database does not exist",
+>   "code": "dbNotFound", "options": { "page": 1, "perPage": 15 } }
+> ```
+> On failure `code` is the **error-code string** (e.g. `dbNotFound`, `accessDenied`, `notFound`,
+> `tableNotFound`, `COMPUTED_FIELD_SETTABLE`), `message` is its human-readable (localized) text, and
+> `result` is `null`. On success `code` is a **number** (`200`, `201`, `202`, `204`).
+> So: treat `result === null` (or a non-numeric `code`) as the failure signal.
+>
+> A few routes — the AI endpoints, schema validation — throw instead and answer with a **real HTTP
+> status** (`401 authRequired`, `403 accessDenied`, `400 emptyBody`). Handle both shapes.
 
 ### 5.2 Get one item
 
 ```
 GET {apiBase}{db}/{table}/{id}
 ```
+Returns the single item (with `createdBy` expanded) and `code: 202`.
 
 ### 5.3 Create item(s)
 
 ```
 POST {apiBase}{db}/{table}
 Body: { ... }            // single item
-Body: [ { ... }, ... ]   // bulk array, also documented for assets
+Body: [ { ... }, ... ]   // bulk array
 ```
+Answers `code: 201` (or the `signupSuccess` message when the table is `users`).
+Never send computed keys — they are derived by the engine (§8.5).
 
 ### 5.4 Update item
 
@@ -273,15 +362,49 @@ Body: [ { ... }, ... ]   // bulk array, also documented for assets
 PUT {apiBase}{db}/{table}/{id}
 Body: { "field": "new value", ... }
 ```
+Answers `code: 200` with the updated item. Add `?return=false` to get `true` instead of the row.
+
+Bulk update (no id in the path) uses `where` as the selector:
+```
+PUT {apiBase}{db}/{table}?where={and:{status:draft}}&{db}_sid=<sid>
+Body: { "status": "published" }
+```
 
 ### 5.5 Delete item(s)
 
 ```
-DELETE {apiBase}{db}/{table}/{id}        // single
+DELETE {apiBase}{db}/{table}/{id}        // single → result: true, code: 204
 DELETE {apiBase}{db}/{table}             // with body = array of ids for bulk
 ```
 
-### 5.6 Assets (uploads are a two-step flow)
+### 5.6 Aggregate — sum a column
+
+```
+GET {apiBase}{db}/{table}/sum?columns=total&where={and:{status:paid}}&{db}_sid=<sid>
+```
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `columns` | string \| list | **required** — one column, a comma-separated list, or an Inison/JSON array. A dotted child path (`items.quantity`) is allowed **only** with `nested=true`. |
+| `where` | Inison | optional, same format as the list GET |
+| `nested` | boolean | `true` aggregates element-wise over an array-of-objects column (dotted path) |
+| `locale`, `{db}_sid` | | as on every read endpoint |
+
+Response (`code: 200`):
+```json
+{ "result": 4250, "message": "", "options": { "page": 1, "perPage": 15 }, "where": {}, "code": 200 }
+```
+- A **single** column returns a number; **several** columns return `{ "total": 4250, "tax": 380 }`.
+- With `nested=true`, `where` keys that resolve as **children of the array root** become per-element
+  predicates and everything else stays a row-level filter:
+  ```
+  # rows where SOME element has quantity > 2, summing that element's quantity
+  GET {db}/{table}/sum?columns=items.quantity&nested=true&where={quantity:>2}
+  ```
+- This is a **server-side** aggregate (no page-size cap) — it is what dashboard counters use (§12.3).
+  `paramsNotCorrect` is returned when `columns` is missing/empty.
+
+### 5.7 Assets (uploads are a two-step flow)
 
 Assets live in the `assets` table; other tables reference them with `type: "table", table: "assets"`.
 
@@ -311,11 +434,24 @@ After this the file is stored and reachable via `publicURL`.
 > **Cleanup:** if no `uploadURL` comes back unexpectedly, delete the just-created record:
 > `DELETE {apiBase}{db}/assets/{id}`.
 
-### 5.7 Table sub-resources
+**Import by URL** (server-side fetch; needs S3 or local storage configured, else `noStorageConfigured`):
+```
+POST {apiBase}{db}/assets/import          // also /assets/import/{folder}
+Body: [ "https://example.com/logo.png", "https://example.com/hero.jpg" ]
+```
+The server creates the `assets` rows (and returns `uploadURL`/`publicURL` when the target storage needs a
+client-side upload).
 
-- Logs: `GET {apiBase}{db}/{table}/logs`
-- Scheduled actions: `GET/POST {apiBase}{db}/{table}/schedules`, `.../schedules/preview`, `PUT/DELETE .../schedules/{id}`, `POST .../schedules/{id}/run`
-- Import / Export (admin-only, long-running jobs): `{apiBase}inicontent/databases/{db}/{table}/import`, `.../export`, `.../export/download`
+### 5.8 Table sub-resources
+
+| Resource | Endpoints | Notes |
+| --- | --- | --- |
+| Activity logs | `GET {apiBase}{db}/{table}/logs` | Requires `config.log: true`. Each entry: `{ item, actions, madeBy, createdAt }` where `actions` is a JSON array of change tuples. |
+| Revert to a log entry | `POST {apiBase}{db}/{table}/{id}/revert` — body `{ "logId": "<logs.id>" }` | Rebuilds the item as it was at that log entry, writes it back, and appends a `revert` log entry. Errors: `missingLogId`, `noLogsFound`, `logNotFound`, `reconstructFailed`, `updateFailed`. |
+| Scheduled actions | `GET/POST {apiBase}{db}/{table}/schedules`, `POST .../schedules/preview`, `PUT/DELETE .../schedules/{id}`, `POST .../schedules/{id}/run` | Cron-based row creation; `excludeWeekdays`, `nextRunAt`, `lastRunAt`, `lastError` (§10.6). |
+| Import | `POST {apiBase}inicontent/databases/{db}/{table}/import` · `GET .../import` | Send the file name via the `x-import-file-name` header (or `{ "fileName": "..." }` / `?fileName=`). Only `.csv` / `.json` (else `unsupportedFormat`); requires `allowedMethods` to include `c`. `GET` returns the job status `{ state, progress, processedRows, totalBytes, error, … }`. |
+| Export | `POST .../export?format=json\|csv` · `GET .../export` · `GET .../export/download` | `format` defaults to `json`. `GET .../export` polls progress (a number, or 404 when idle). Download requires an admin session. |
+| Sum | `GET {apiBase}{db}/{table}/sum` | §5.6 |
 
 ---
 
@@ -354,6 +490,9 @@ Logical grouping — keys `and` / `or` (shown inside a `where` Inison string, i.
 {and:{status:published,age:{or:[>10,<20]}}}
 ```
 
+Nested field paths work in `where` and in `columns` — `items.product`, `items.quantity`, and dotted
+computed columns such as `items.lineTotal` (§8.8).
+
 ### 6.2 `options` param (pagination / projection / sort) — Inison format
 
 Serialize with the `inison` package:
@@ -376,26 +515,30 @@ const options = Inison.stringify({
   // => {and:{status:published,tag:*news}}
   ```
 - Send both URL-encoded in the query string (`encodeURIComponent(options)` / `encodeURIComponent(where)`).
+- `perPage: -1` returns **every** matching row (no cap) — use it for small tables and reference pickers
+  only; the default cap is 15.
 
 ---
 
 ## 7. Table structure — schema & field types (read it, edit it, create it)
 
 A table's structure is its **schema** — a `Schema` (that is `Field[]`). Read it from the DB
-metadata (§4, `tables[*].schema`). You create/edit it with the **meta endpoints** (§9), or let the
-platform AI design it (§9.3) using the rules below (§7.4).
+metadata (§4, `tables[*].schema`). You create/edit it with the **meta endpoints** (§10), or let the
+platform AI design it (§11.3) using the rules below (§7.5).
 
 ### 7.1 The `Field` object
 
 ```ts
 type Field = {
+  id?: number;                                 // numeric id, assigned when the field is created
   key: string;                                  // field name (DB's primary language)
   type: "string" | "number" | "boolean" | "date" | "email" | "url"
       | "table" | "object" | "array" | "password" | "html" | "ip" | "json" | "id";
   subType?: "text" | "textarea" | "radio" | "checkbox" | "tags" | "color"
-          | "select" | "role" | "icon" | "multiple" | "range" | "locale" | ...;
+          | "select" | "role" | "icon" | "multiple" | "range" | "locale" | "table" | ...;
   required?: boolean;
   unique?: boolean | string;                    // string = grouped-uniqueness key, e.g. "nameCategoryGroup"
+  regex?: string;                               // validation pattern
   options?: (string | number)[];                // choices for select/radio/checkbox/multiple...
   defaultValue?: unknown;
   table?: string;                               // target slug — REQUIRED on type "table" (and table-list arrays)
@@ -403,11 +546,16 @@ type Field = {
   date?: "datetime" | "daterange" | "month" | "year" | "week" | "quarter" | ...;
   min?: number;
   max?: number;
+  computed?: string | { expr: string; ast: unknown };  // engine-derived column — see §8
+  prefix?: string;                              // display-only affix for number columns (e.g. "$")
+  suffix?: string;                              // display-only affix (e.g. "%", "kg")
 };
 ```
 
 > Fields also carry a numeric `id` (assigned when the field is created) — flows reference fields
-> by `id` or by `key` (§8).
+> by `id` or by `key` (§9), and **computed expressions reference fields by `id` only** (§8.2).
+> `prefix` / `suffix` are pure presentation: they are stored on the field so they survive schema
+> round-trips but are never sent to the expression engine.
 
 ### 7.2 `children` rules (array / object)
 
@@ -419,13 +567,14 @@ type Field = {
   - a relation list: `{ type: "array", children: "table", table: "users" }`
 - `type: "table"` is a **single** relation — do NOT set `children`, only `table`.
 - Any `children` that mention `table`/`id` require a matching `table` target.
+- Nested Field objects may themselves be computed (§8.4).
 
 ### 7.3 Field types at a glance
 
 | Type | Notes |
 | --- | --- |
 | `string` | plain text |
-| `number` | numeric |
+| `number` | numeric — the **only** type a computed column may use |
 | `boolean` | true/false |
 | `date` | date/time; `date` sub-property: `datetime`, `daterange`, `month`, `year`, `week`, `quarter`… |
 | `email` | validated email |
@@ -447,13 +596,15 @@ Widgets (`subType` and CMS-specific forms — the *data* you send stays plain):
 | `select`, `radio` | the chosen value (string/number) |
 | `checkbox`, `tags`, `multiple`, `range`, `array-select` | an array of values |
 | `color`, `icon`, `role`, `locale`, `slider`, `mention` | a single value (color hex, tabler icon name, role id, locale code…) |
+| `asset`, `array-asset` | sugar for `type: "table", table: "assets"` (and its array form) |
+| `table`, `array-table` | relation widgets over a `table` field |
 
 > When **creating** items, send plain values: strings for `select`/`radio`, arrays for
 > `tags`/`checkbox`/`array-*`, IDs for `table` refs, objects/arrays for `object`/`array`.
 
 ### 7.4 Canonical schema rules (the same rules the platform AI uses — apply them when you design tables)
 
-These come from the AI prompt embedded in the API (`{apiBase}{db}/ai/tables`, §9.3):
+These come from the AI prompt embedded in the API (`{apiBase}{db}/ai/tables`, §11.3):
 
 1. **Editing** an existing table → send the **full** schema (existing fields + new/modified ones).
    A partial `schema` **replaces** the whole field list on update — always merge first.
@@ -465,6 +616,8 @@ These come from the AI prompt embedded in the API (`{apiBase}{db}/ai/tables`, §
 4. New tables: `isNew: true`; edits: `isNew: false`.
 5. Icons are **Tabler icon names** normalized to kebab-case (`building-store`) — tabler.io/icons.
 6. Use the DB's **primary language** for table slugs, field keys, role names and labels.
+7. Add a `label` on tables/fields when the app is multilingual; it is translated through the
+   `translations` table, not by renaming keys.
 
 ### 7.5 Example — the default `users` table (real source)
 
@@ -475,14 +628,174 @@ These come from the AI prompt embedded in the API (`{apiBase}{db}/ai/tables`, §
   { "key": "email",    "type": "email",   "required": true },  // field id 3
   { "key": "role",     "type": "id", "subType": "role", "required": true }, // id 4
   { "key": "createdBy","type": "table", "table": "users" },    // id 5
+  { "key": "config",   "type": "json" },                       // id 6
 ]
 ```
 (Default roles: 1 = admin, 2 = user, 3 = guest. The built-in flows use field ids: `@user.4`
-= role, `@data.2` = password, `@data.5` = createdBy.)
+= role, `@data.2` = password, `@data.5` = createdBy. `config` is a free JSON column for
+per-user preferences.)
 
 ---
 
-## 8. Flows (data automation) — structure, edit, create
+## 8. Computed fields — engine-derived columns
+
+A **computed field** is a column the **database engine** recalculates on every write. The result is
+stored on the row, is **read-only**, and can never be assigned by a client. This is the supported way
+to derive totals, averages, line totals, discounts, scores — anything that must always be consistent
+with its inputs.
+
+### 8.1 Declaring a computed field
+
+Put a `computed` expression on the field (the field itself is always a `number`):
+
+```jsonc
+{
+  "key": "total",
+  "type": "number",
+  "computed": "sum(5 * 6)"   // quantity × price, summed over every item
+}
+```
+
+The engine compiles it and persists the compiled form on the schema:
+
+```jsonc
+"computed": { "expr": "sum(5 * 6)", "ast": { /* id-based AST */ } }
+```
+
+- Send the **raw string** when creating/editing a table; the API answers with the persisted
+  `{ expr, ast }` spec — read `expr` back for display (`computedExprOf(field)` in the layer).
+- The AST stores **field ids**, not keys, so renaming a field or a table never retargets an expression.
+- Adding or editing an expression on an existing table **backfills every existing row**; a failing
+  expression aborts the schema change and leaves the old schema and values untouched.
+
+### 8.2 The expression language
+
+```
+expression := term (("+" | "-") term)*
+term       := factor (("*" | "/" | "%") factor)*      // "*" = multiply
+factor     := integer | path | function | "(" expression ")"
+path       := id ( "." id )*                          // "." = link/binding hop
+function   := ("sum" | "count" | "avg" | "min" | "max") "(" expression ")"
+```
+
+| Rule | Detail |
+| --- | --- |
+| Operators | `+` add, `-` subtract, `*` multiply, `/` divide, `%` modulo, `(...)` grouping |
+| Precedence | `* / %` bind tighter than `+ -`: `2 * 3 + 4` = 10, `2 * (3 + 4)` = 14 |
+| References | **Every symbol is a numeric field `id`** from the table's schema (nested children included) |
+| Id-or-literal | a bare integer that **matches a field id** is that field; an integer that matches nothing is a literal. So `6 / 4` divides field #6 by field #4, while `314 / 100` is 3.14 |
+| No decimals | `.` is reserved for links, so `3.14` is a *path* (field 3 → field 4), never the decimal. Use division: `314 / 100` |
+| Link hops | `3.4` reads field #4 of the row linked by field #3; field #3 must be `type: "table"`. Hops work inside functions: `sum(5 * 3.2)` = `quantity × product.price` |
+| Functions | `sum`, `count`, `avg`, `min`, `max` iterate the elements of an **array-of-objects** column. The argument is a full expression evaluated once per element, then aggregated. All paths in the argument must belong to the *same* array |
+| Missing operands | a missing/null operand is read as `0` rather than failing the write |
+| Limits | expression ≤ **512** characters, AST depth ≤ **64** |
+| Dependencies | computed fields are evaluated in dependency order, so one computed field may use another (cycles are rejected) |
+
+### 8.3 Worked example — order total
+
+```text
+orders
+  items (array)  →  quantity (id 5)   price (id 6)
+  total = sum(5 * 6)
+
+items: [{quantity: 2, price: 250}, {quantity: 1, price: 100}]
+→ total = (2 × 250) + (1 × 100) = 600
+```
+`count(5)` = number of elements, `avg(5)` = average, `min(5)` / `max(5)` = lowest / highest.
+
+### 8.4 Computed children (element-level)
+
+A computed field on a **child of an array-of-objects** column is recalculated once per element:
+
+```jsonc
+{
+  "key": "items", "type": "array",
+  "children": [
+    { "key": "product",  "type": "table", "table": "products" },   // id 3
+    { "key": "quantity", "type": "number" },                        // id 4
+    { "key": "lineTotal","type": "number", "computed": "4 * 3.2" }  // quantity × product.price
+  ]
+}
+{ "key": "totalCents", "type": "number", "computed": "sum(5)" }     // id 6 → sum of lineTotal
+```
+
+Rules for computed children:
+- the child field **must be `type: "number"`**;
+- every reference must be a **sibling child of the same array** (plus link hops from them) — top-level
+  columns and helper functions (`sum`, `count`, …) are rejected inside a child expression;
+- arrays of arrays of objects are not supported as a computed root;
+- they are read-only and stripped on write, exactly like top-level computed columns;
+- in a dashboard counter, pick the **dotted** field (`items.lineTotal`) with the **Sum** operation.
+
+### 8.5 Read-only rules
+
+- The value is derived at write time and stored on the row → it is returned by every read, and can be
+  filtered (`where`) and sorted like any other column.
+- Sending a computed key in a `POST`/`{table}` or `PUT`/`{table}/{id}` body is rejected by the engine
+  with `COMPUTED_FIELD_SETTABLE`.
+- The REST API (and the CMS admin, mobile apps and offline replays) **strips computed keys before
+  writing**, so echoing a whole row back is safe. Prefer stripping client-side too — never build a
+  create/update body from a response that includes computed values.
+- Use `options.columns` to project computed keys in/out like any column.
+
+### 8.6 Conflicts & validation
+
+- A computed field **cannot** be `required`, `unique` or carry a `regex` → `COMPUTED_FIELD_CONFLICT`.
+  (The CMS clears those properties when you type an expression; when writing the schema by hand,
+  omit them.)
+- Invalid syntax, an unknown field id, a non-link hop, a container as a target, a cycle, a dangling
+  link or an arithmetic failure are all rejected **when the schema is saved** (or when the offending
+  row is written), never silently.
+
+### 8.7 Error codes
+
+| Code | Meaning / fix |
+| --- | --- |
+| `COMPUTED_FIELD_SYNTAX` | unparsable expression, empty string, or longer than 512 chars |
+| `COMPUTED_FIELD_UNKNOWN_FIELD` | a referenced id does not exist in the table (or in the linked table) |
+| `COMPUTED_FIELD_INVALID_LINK` | a `.` hop whose parent field is not a `table` reference |
+| `COMPUTED_FIELD_INVALID_TARGET` | referencing a container (array/object), a top-level column from a child expression, a helper inside a child expression, or arrays-of-arrays |
+| `COMPUTED_FIELD_CONFLICT` | `required` / `unique` / `regex` combined with `computed` |
+| `COMPUTED_FIELD_CYCLE` | computed fields depend on each other in a loop |
+| `COMPUTED_FIELD_SETTABLE` | a client tried to assign the computed key |
+| `COMPUTED_FIELD_DANGLING_LINK` | a hop pointed at a relation row that no longer exists |
+| `COMPUTED_FIELD_ARITHMETIC` | a non-numeric operand (e.g. dividing by a string field) |
+
+### 8.8 Working with computed fields from the API
+
+```ts
+// 1) declare (admin) — merge into the full schema, then PUT the table
+const schema = [
+  { key: "status", type: "string" },                                   // id 1
+  { key: "items", type: "array", children: [
+      { key: "product",   type: "table", table: "products" },          // id 3
+      { key: "quantity",  type: "number" },                            // id 4
+      { key: "lineTotal", type: "number", computed: "4 * 3.2" },       // id 5
+  ]},
+  { key: "total", type: "number", computed: "sum(5)" },                 // id 6
+];
+// PUT {apiBase}inicontent/databases/{db}/orders  body: { schema }
+
+// 2) write data — never include total / lineTotal
+await $fetch(`${apiBase}${db}/orders`, {
+  method: "POST",
+  body: { items: [{ product: productId, quantity: 2 }] },
+  // → items[0].lineTotal = 2 × product.price, then total = sum of the lineTotals
+});
+
+// 3) read / aggregate
+// GET {db}/orders?options={perPage:-1,columns:[id,total]}
+// GET {db}/orders/sum?columns=total
+// GET {db}/orders/sum?columns=items.lineTotal&nested=true
+```
+
+Nuxt auto-imports the layer's `app/composables/computedField.ts` helpers into your app code:
+`isComputedField(field)`, `computedExprOf(field)`, `computedKeysOf(schema)`,
+`computedAffixesOf(field)` and `stripComputedKeys(schema, row)`.
+
+---
+
+## 9. Flows (data automation) — structure, edit, create
 
 **Flows** are per-table automation scripts stored on the table object:
 
@@ -490,7 +803,7 @@ These come from the AI prompt embedded in the API (`{apiBase}{db}/ai/tables`, §
   incoming item (`@data`) or the query filters (`@where`), send emails.
 - `onResponse: FlowType[]` — run on the outgoing data (e.g. hide a field).
 
-### 8.1 `FlowType` — one flow = an array of rule tuples
+### 9.1 `FlowType` — one flow = an array of rule tuples
 
 Each **flow** is an array of `FlowType` rules executed in order. `[null, null, null]` is a no-op
 placeholder. If a **condition** rule is false, the rest of that flow is skipped (the next flow starts).
@@ -500,10 +813,10 @@ placeholder. If a **condition** rule is false, the rest of that flow is skipped 
 | Condition | `[path, operator, value]` | If the comparison fails → abort this flow (skip its remaining rules). |
 | `set` | `["set", path, value]` | Write into the incoming item (`@data.…`) or the query filters (`@where.…`). |
 | `unset` | `["unset", path]` or `["unset", [path, ...]]` | Remove a field from the item/filters; on `onResponse` it hides the field from the reply. |
-| `error` | `["error", message]` | Abort the whole request with that error (e.g. `"accessDenied"` → 403). |
+| `error` | `["error", message]` | Abort the whole request with that error (e.g. `"accessDenied"` → `result: null` + `code: "accessDenied"`). |
 | `email` | `["email", to, templateName]` | Send a transactional email (template from the `templates` table; variables = record fields + `user_*`). |
 
-### 8.2 Value & path sources (the `@` getters)
+### 9.2 Value & path sources (the `@` getters)
 
 | Prefix | Resolves to |
 | --- | --- |
@@ -516,19 +829,20 @@ placeholder. If a **condition** rule is false, the rest of that flow is skipped 
 Fields can be referenced by **numeric field id** (`@data.4`) or by **key name** (`@data.role`).
 A literal value (a plain string/number without `@`) is used as-is.
 
-### 8.3 Operators (same as the `where` operators in §6)
+### 9.3 Operators (same as the `where` operators in §6)
 
 `=` `!=` `*` (contains) `!*` `[]` (is one of) `![]` `>` `>=` `<` `<=`
 
-### 8.4 Example — the built-in `users` flows (real source, numeric form)
+### 9.4 Example — the built-in `users` flows (real source, numeric form)
 
 ```jsonc
 // users.onRequest
 [
   // Non-POST requires a signed-in user (role = field 4):
   [["@method","!=","POST"], ["@user.4","=",null], ["error","accessDenied"]],
-  // Creating/updating: guests get role 2; others keep their role and stamp createdBy (field 5):
-  [["@user.4","=",null], ["@method","[]",["POST","PUT"]], ["set","@data.4",2]],
+  // Creating/updating without a role → guest/user role 2; signed-in users keep
+  // their role and stamp createdBy (field 5):
+  [["@data.4","=",null], ["@method","[]",["POST","PUT"]], ["set","@data.4",2]],
   [["@user.0","!=",null], ["@method","[]",["POST","PUT"]],
    ["@user.4","![]",[1,"@data.4"]], ["set","@data.4","@user.4"],
    ["@user.0","!=","@data.5"], ["set","@data.5","@user.0"]],
@@ -542,8 +856,10 @@ A literal value (a plain string/number without `@`) is used as-is.
 [[["unset","@data.2"]]]
 ```
 
+> Flows run for the session's user, **except** for the platform super-admin (`idOne`), whose requests
+> bypass them. Don't rely on a flow to constrain a super-admin.
 
-### 8.5 Saving / creating flows
+### 9.5 Saving / creating flows
 
 ```
 PUT {apiBase}inicontent/databases/{db}/{tableSlug}
@@ -551,46 +867,63 @@ Body: { "onRequest": <FlowType[]>, "onResponse": <FlowType[]> }
 ```
 - The arrays **replace** the table's flows wholesale — send the full list (merge first).
 - The editor UI shape is `[{ id, value: [{ id, value: [rule, ...] }] }]`; serialize each rule to a
-  plain tuple before sending (as in §8.4).
-- The same endpoint also updates schema/config (§9.1); the admin UI lives at
+  plain tuple before sending (as in §9.4).
+- The same endpoint also updates schema/config (§10.1); the admin UI lives at
   `/admin/tables/{table}/flows`.
-- Email templates come from the `templates` table; SMTP is configured in database settings.
+- Email templates come from the `templates` table; SMTP is configured in database settings
+  (`email` on the database, §4) and tested with `POST inicontent/databases/{db}/email/test`.
 
 ---
 
-## 9. Creating & editing tables, schemas and flows (meta endpoints)
+## 10. Creating & editing tables, schemas and flows (meta endpoints)
 
 These endpoints manage **structure** (not data). All require `{db}_sid=<sid>`; table
 create/update/delete and database-level endpoints are reserved for the database owner/admin.
 
-### 9.1 Table structure endpoints
+### 10.1 Table structure endpoints
 
 | Action | Method & path | Body | Notes |
 | --- | --- | --- | --- |
 | Create table | `POST {apiBase}inicontent/databases/{db}/{newTableSlug}` | `{ schema, config?, label?, icon?, allowedMethods? }` | slug comes from the URL; id auto-assigned; `allowedMethods` defaults to `"crud"`; `config.log: true` also creates a `{table}/logs` table |
-| Update table | `PUT {apiBase}inicontent/databases/{db}/{tableSlug}` | full table object: `{ ...existing, schema?, onRequest?, onResponse?, config?, label?, icon?, allowedMethods?, columns?, displayAs?, show?, slug? }` | `schema`, `onRequest`, `onResponse` **replace** wholesale — keep/default the rest; `slug` renames (blocked on `users`, `assets`, `pages`, `blocks`; PUT itself blocked on `sessions`/`translations`); toggling `config.log` creates/deletes the `{table}/logs` table |
-| Delete table | `DELETE {apiBase}inicontent/databases/{db}/{tableSlug}` | — | blocked on `users`, `assets`, `pages`, `blocks`, `sessions`, `translations` |
-| Create database | `POST {apiBase}inicontent/databases/{newDbSlug}` | `{ username, password, email, roles?, tables?, primaryColor?, ... }` | scaffolds the system tables + admin user and returns a session cookie |
+| Update table | `PUT {apiBase}inicontent/databases/{db}/{tableSlug}` | full table object: `{ ...existing, schema?, onRequest?, onResponse?, config?, label?, icon?, allowedMethods?, columns?, displayAs?, show?, slug? }` | `schema`, `onRequest`, `onResponse` **replace** wholesale — keep/default the rest; `slug` renames (blocked on `users`, `assets`, `pages`, `blocks`; PUT itself blocked on `sessions`/`translations`); toggling `config.log` creates/deletes the `{table}/logs` table; `config.content` sets the SEO declaration (§4.2) |
+| Delete table | `DELETE {apiBase}inicontent/databases/{db}/{tableSlug}` | — | blocked on `users`, `assets`, `pages`, `blocks`, `sessions`, `translations`, `backups` |
+| Create database | `POST {apiBase}inicontent/databases/{newDbSlug}` | `{ username, password, email, roles?, tables?, primaryColor?, ... }` | scaffolds the system tables (§1) + admin user and returns a session cookie |
 | Update database | `PUT {apiBase}inicontent/databases/{db}` | `{ email?, roles?, slug?, primaryColor?, ... }` | `tables` is ignored here — change tables via the endpoints above |
+| List databases | `GET {apiBase}inicontent/databases` | — | databases visible to the session |
+| Read database | `GET {apiBase}inicontent/databases/{db}` | — | §4 |
 | Item-form schema | `POST/PUT {apiBase}{db}/{table}/schema` | an item draft | runs the table's `onRequest` flows against schema+data → `{ schema, data, error }`; used by the CMS item editor for dynamic forms |
 
+> **There is no `GET {db}/{table}/schema`.** Only `POST` and `PUT` exist on that path — read a table's
+> schema from `GET inicontent/databases/{db}` (§4) instead.
+>
+> **Built-in tables keep their built-in fields.** When you `PUT` a schema for `users`, `pages` or
+> `blocks`, the new schema must still contain every built-in key —
+> `users`: `username`, `email`, `password`, `role`, `createdBy` · `pages`: `slug`, `content`, `seo` ·
+> `blocks`: `name`, `config`, `hideOn`. If one is missing the schema is **silently not applied**
+> (the endpoint still answers `200` with the unchanged schema), so re-read the table after a schema PUT
+> and confirm the fields are there.
+>
 > **Workflow for editing a table's structure:** `GET {apiBase}inicontent/databases/{db}` → take the
 > current `tables[*].schema` (and `onRequest`/`onResponse`) → merge your changes → `PUT` back the
 > full objects.
 
-### 9.2 Example — create a table, then update its flows
+### 10.2 Example — create a table, then update its flows
 
 ```bash
 # 1) Create the table (schema is required)
 curl -s -X POST "https://api.inicontent.com/inicontent/databases/myapp/orders?myapp_sid=<sid>" \
   -H "Content-Type: application/json" \
   -d '{"schema":[
-         {"key":"number","type":"string","required":true},
-         {"key":"total","type":"number"},
+         {"key":"items","type":"array","children":[
+            {"key":"quantity","type":"number","required":true},
+            {"key":"unitPrice","type":"number","required":true}
+         ]},
+         {"key":"total","type":"number","computed":"sum(2 * 3)"},
          {"key":"customer","type":"table","table":"users"},
          {"key":"status","type":"string","subType":"select",
           "options":["pending","paid","shipped"]}
        ],
+       "config":{"log":true},
        "icon":"shopping-cart","label":"Orders"}'
 
 # 2) Update flows (send the full onRequest/onResponse lists — they replace)
@@ -602,30 +935,297 @@ curl -s -X PUT "https://api.inicontent.com/inicontent/databases/myapp/orders?mya
        ],
        "onResponse":[]}'
 ```
+(Field ids follow declaration order across the whole schema, children included: `items` = 1,
+`quantity` = 2, `unitPrice` = 3 — so `sum(2 * 3)` is the order total, summed over `items`.)
 
-### 9.3 AI assistance endpoints (the platform's built-in AI)
+### 10.3 Database-level endpoints
 
-The CMS ships an AI assistant ("AI Assistant") with endpoints under `{apiBase}{db}/ai` (also
-aliased at `{apiBase}inicontent/ai`). They require a session and are rate-limited. The **table**
-endpoint embeds the canonical schema rules quoted in §7.4.
-
-| Endpoint | Body | Response |
+| Action | Method & path | Body / notes |
 | --- | --- | --- |
-| `POST {apiBase}{db}/ai` — router | `{ message }` | `{ action: "redirect", target: "tables" \| "pages" \| "data" \| "translate" \| "databases" }` or `{ action: "greeting" \| "rejected", message }` |
-| `POST {apiBase}{db}/ai/tables` | `{ message, responseID?, existingTables? }` | `{ responseID, response }` — `response.action`: `clarification_needed` (`questions[]`), `tables_approval_pending` (`tables[]: { slug, icon, isNew, schema, demo[] }`), `roles_defined` (`roles[]: { role, permissions: [{ table, allowedMethods }] }`), `greeting`, `rejected`, `completed` |
-| `PUT {apiBase}{db}/ai/tables` | `{ tables: [{ slug, schema?, icon?, label? }] }` | `{ results: [{ slug, action: "created" \| "updated", success, error? }], tables[] }` — applies approved schemas; system tables (users, sessions, assets, translations, pages, blocks, dashboards) are protected |
-| `POST/PUT {apiBase}{db}/ai/data` | `{ message, responseID?, existingTables? }` | `data_approval_pending` with `items: [{ table, records[] }]` |
-| `POST {apiBase}{db}/ai/pages` | `{ message, ... }` | generates page content/schemas (may fetch stock images) |
-| `POST/PUT {apiBase}{db}/ai/translate` | translation request | translation flow |
-| `POST {apiBase}{db}/ai/databases` | database request | database-scoped flow |
+| Database export | `POST {apiBase}inicontent/databases/{db}/export` | queues a private archive of all schemas + records (**asset files are not included**); `anExportJobAlreadyRunning` if one is in flight |
+| Export status | `GET {apiBase}inicontent/databases/{db}/export` | `{ state: queued\|running\|completed\|failed\|expired, progress, processedBytes, totalBytes, destination, consistency, createdAt, updatedAt, expiresAt, error? }`, or 404 when there is none |
+| Export download | `GET {apiBase}inicontent/databases/{db}/export/download` | the archive file |
+| Attach domain | `POST {apiBase}inicontent/databases/{db}/domains` | `{ domainName }` — requires domain management to be configured on the deployment, else `operationFailed` |
+| Domain status | `GET {apiBase}inicontent/databases/{db}/domains/{domainName}` | association state |
+| Detach domain | `DELETE {apiBase}inicontent/databases/{db}/domains/{domainName}` | — |
+| Test email | `POST {apiBase}inicontent/databases/{db}/email/test` | `{ email, templateName? \| templateContent?, subject?, variables? }` — sends a real email |
+| Preview email | `POST {apiBase}inicontent/databases/{db}/email/preview` | `{ templateName? \| templateContent?, subject?, variables? }` — renders without sending |
 
-> Use these to design a database with the same conventions as the CMS's own assistant. After
-> approval, apply the tables with `PUT .../ai/tables` (admin) — or replicate the returned table
-> objects through §9.1 yourself.
+### 10.4 Dashboards data endpoints
+
+`dashboards` is a normal table, so it uses the ordinary data endpoints — but its built-in flow allows
+`GET` to everyone with a session and rejects writes to non-admins:
+
+```
+GET    {apiBase}{db}/dashboards            # list
+GET    {apiBase}{db}/dashboards/{id}       # one
+POST   {apiBase}{db}/dashboards            # { name, description?, icon?, widgets? }
+PUT    {apiBase}{db}/dashboards/{id}       # same body
+DELETE {apiBase}{db}/dashboards/{id}
+```
+The AI equivalents are in §11.6. Widget structure is in §12.2.
+
+### 10.5 Backups & restore
+
+Admin-only; requires storage to be configured (`noStorageConfigured`), and only one job at a time
+(`backupJobAlreadyRunning`).
+
+| Action | Method & path | Body / notes |
+| --- | --- | --- |
+| List | `GET {apiBase}{db}/backups` | supports `where` + `options`; each entry `{ name, extension, size, publicURL?, type: "full"\|"table", table?, automatic, state, error?, restoreState?, restoredAt? }` |
+| Create | `POST {apiBase}{db}/backups` | `{ type: "full" \| "table", table?, name? }` → queues a job (`state`: `queued` → `running` → `completed`/`failed`) |
+| Restore | `POST {apiBase}{db}/backups/{id}/restore` | `{ scope, confirm: true, table? }` — `scope` is one of `table`, `table-schema`, `table-data`, `database-schema`, `database-data`, `database-full`; `table` is required for `table*` scopes. Errors: `invalidBackupScope`, `confirmationRequired`, `tableNotSpecified` |
+| Delete | `DELETE {apiBase}{db}/backups[/{id}]` | — |
+
+### 10.6 Schedules
+
+`GET/POST {apiBase}{db}/{table}/schedules` · `POST .../schedules/preview` ·
+`PUT/DELETE .../schedules/{id}` · `POST .../schedules/{id}/run`
+
+A schedule row: `{ name, preset: hourly|daily|weekly|monthly|custom, cronExpression, timezone: "UTC",
+isActive, payload, excludeWeekdays?, nextRunAt?, lastRunAt?, lastError? }`. `payload` is a JSON object
+(or Inison string) for the row to create and may use the template variables
+`{{ now }}`, `{{ now + 2h }}`, `{{ now|iso }}`, `{{ today|date }}`, `{{ schedule.id }}`,
+`{{ database.slug }}`, `{{ table.slug }}`, `{{ run.iso }}`. `.../schedules/preview` resolves those
+variables without running anything.
+
+### 10.7 SEO artifacts
+
+```
+GET {apiBase}{db}/seo/sitemap.xml
+GET {apiBase}{db}/seo/robots.txt
+GET {apiBase}{db}/seo/feed.xml
+GET {apiBase}{db}/seo/schema.json
+```
+These return **raw** `application/xml` / `text/plain` documents (not the JSON envelope), derived from
+each table's `config.content` declaration (§4.2), and records are read **through the table's
+`onRequest` flow** — a draft hidden from anonymous visitors is never advertised.
 
 ---
 
-## 10. Routing / admin surface
+## 11. AI endpoints (the platform's built-in assistant)
+
+The CMS ships an AI assistant with endpoints under `{apiBase}{db}/ai` (the `{db}` segment is the
+database the assistant is working on — including a database that was just created by
+`POST {db}/ai/databases`). Use them to design a database with the same conventions as the CMS itself.
+
+### 11.1 General rules
+
+- **Admin-only:** every AI endpoint requires the caller's `role` to equal `idOne` — otherwise
+  `403 accessDenied`. A non-admin session cannot use the assistant at all.
+- **Rate-limited** per user; a session cookie/query param is mandatory (`401 authRequired` without one).
+- **Conversation threading:** every request accepts `responseID` (returned by the previous call) and
+  sends it back as `previous_response_id` to keep the model's context.
+- **Envelope:** each call answers
+  ```json
+  { "responseID": "resp_…", "response": { "action": "…", "message": "…", /* action-specific fields */ } }
+  ```
+  The action-specific payload is described per endpoint below.
+- **Context:** pass `existingTables` (the `tables[]` array from §4) so the model works against the real
+  schema instead of guessing.
+- **Propose → apply:** `POST` endpoints only *propose*; the matching `PUT`/`DELETE` endpoint *applies*
+  what the user approved. Never apply an unapproved proposal.
+- **Protected tables** (rejected by the apply endpoints): `users`, `sessions`, `assets`, `translations`,
+  `pages`, `blocks`, `dashboards`, `templates`, `backups`, `passkey_credentials`, `passkey_challenges`.
+
+| Endpoint | Method & path | Body | Response `response.action` |
+| --- | --- | --- | --- |
+| Router | `POST {apiBase}{db}/ai` | `{ message, responseID? }` | `redirect` (with `target`), `greeting`, `rejected` |
+| Tables | `POST {apiBase}{db}/ai/tables` | `{ message, responseID?, existingTables?, step?, approvedTables? }` | `clarification_needed` (`questions[]`), `tables_naming_pending`, `tables_approval_pending` (`tables[]`), `tables_delete_pending`, `roles_defined` (`roles[]`), `greeting`, `rejected`, `completed` |
+| Tables (apply) | `PUT {apiBase}{db}/ai/tables` | `{ tables: [{ slug, schema?, icon?, label? }] }` | `{ results: [{ slug, action: "created"\|"updated", success, error? }], tables[] }` |
+| Tables (delete) | `DELETE {apiBase}{db}/ai/tables` | `{ tables: [slug] }` | `{ results: [{ slug, success, error? }] }` |
+| Data | `POST {apiBase}{db}/ai/data` | `{ message, responseID?, existingTables? }` | `data_approval_pending` (`items: [{ table, records[] }]`, `remainingTables[]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
+| Data (apply) | `PUT {apiBase}{db}/ai/data` | `{ items: [{ table, records[] }] }` | `{ results: [{ table, count, success, error? }] }` |
+| Pages | `POST {apiBase}{db}/ai/pages` | `{ message, responseID?, slugPrefix?, existingTables?, reusableBlocks? }` | `structure_generated`, `content_generated`, `images_generated`, `clarification_needed`, `greeting`, `rejected`, `completed` |
+| Translate | `POST {apiBase}{db}/ai/translate` | `{ message, responseID?, existingTables?, primaryLanguage?, secondaryLanguages? }` | `translation_approval_pending` (`items: [{ table, locale, scope?: "records"\|"schema" }]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
+| Translate (apply) | `PUT {apiBase}{db}/ai/translate` | `{ items: [{ table, locale, scope? }] }` | `{ results: [...] }` |
+| Databases | `POST {apiBase}{db}/ai/databases` | `{ message, responseID? }` | `database_approval_pending` (`database: { slug, primaryLanguage?, secondaryLanguages?, primaryColor?, tablesPrompt? }`), `clarification_needed`, `greeting`, `rejected` |
+| Dashboards | `POST {apiBase}{db}/ai/dashboards` | `{ message, responseID?, existingTables?, existingDashboards? }` | `dashboards_approval_pending` (`dashboards[]`), `dashboards_delete_pending` (`deleteIDs[]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
+| Dashboards (apply) | `PUT {apiBase}{db}/ai/dashboards` | `{ dashboards: [{ id?, name, description?, icon?, widgets? }] }` | `{ results: [{ id, name, action: "created"\|"updated", success, error? }], dashboards[] }` |
+| Dashboards (delete) | `DELETE {apiBase}{db}/ai/dashboards` | `{ ids: [id] }` (or `deleteIDs`) | `{ results: [{ id, success, error? }] }` |
+| Content | `POST {apiBase}{db}/ai/content` | `{ table, count?, topic?, audience?, tone?, length?, keywords?, fields?, step?, responseID?, content?, title? }` | `outline_ready` (`outlines[]`), `content_approval_pending` (`records: [{ values, outline?, pending? }]`, `remaining[]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
+
+### 11.2 Router
+
+`POST {apiBase}{db}/ai` classifies the request and tells the client where to continue:
+
+```json
+{ "responseID": "resp_…", "response": { "action": "redirect", "target": "tables" } }
+```
+
+`target` is one of `tables`, `data`, `pages`, `translate`, `databases`, **`dashboards`**.
+(`greeting` short-circuits without a model call on a fresh conversation; `rejected` means the request
+was out of scope.)
+
+### 11.3 Tables agent
+
+`POST {apiBase}{db}/ai/tables` embeds the canonical schema rules quoted in §7.4, so its proposals
+follow them. `tables_approval_pending` returns full table proposals:
+
+```json
+{ "response": { "action": "tables_approval_pending", "tables": [
+  { "slug": "orders", "icon": "shopping-cart", "isNew": true,
+    "schema": [ /* Field[] — may include `computed` expressions (§8) */ ],
+    "demo": [ /* sample rows */ ] }
+] } }
+```
+- `step` drives the naming pass: `tables_naming_pending` proposes slugs/labels first; send the accepted
+  names back as `approvedTables` to get schemas.
+- `roles_defined` returns `roles: [{ role, permissions: [{ table, allowedMethods }] }]`.
+- Apply with `PUT {apiBase}{db}/ai/tables` (`{ tables: [{ slug, schema, icon?, label? }] }`), which
+  creates/updates in one call and reports per-table success.
+- Delete with `DELETE {apiBase}{db}/ai/tables` (`{ tables: [slug] }`); protected tables come back as
+  `{ success: false, error: "Cannot delete protected system table" }` without aborting the batch.
+
+### 11.4 Content agent (long-form generation)
+
+`POST {apiBase}{db}/ai/content` generates long-form text for **any** table that has long-text columns:
+
+```jsonc
+// 1) plan
+{ "table": "articles", "count": 5, "topic": "…", "audience": "…",
+  "tone": "professional",            // neutral|conversational|professional|persuasive|technical|friendly|formal
+  "length": "medium",                // short|medium|long  → ~150-300 / 400-700 / 900-1400 words
+  "keywords": ["…"], "fields": ["title", "body"], "step": "outline" }
+// → { "response": { "action": "outline_ready", "outlines": [ … ] } }
+
+// 2) write the first piece, report the rest as pending
+{ …, "step": "draft", "responseID": "resp_…" }
+// → { "response": { "action": "content_approval_pending",
+//                   "records": [{ "values": { "title": "…", "body": "…" } },
+//                               { "values": {}, "pending": true }],
+//                   "remaining": [1, 2, 3, 4] } }
+
+// 3) derive SEO metadata for a body you already hold
+{ "table": "articles", "step": "seo", "title": "…", "content": "<the draft>" }
+// → { "response": { "action": "content_approval_pending", "records": [{ "values": { … } }] } }
+```
+
+- Only long-text columns are generated for; a table without them answers `noContentFields`.
+- `count` is capped (max 20 records per call) and the table must not be protected.
+- The agent only **proposes**: write the approved values with
+  `PUT {apiBase}{db}/ai/data` as `{ items: [{ table, records: [values] }] }` (§11.5) or plain table writes.
+
+### 11.5 Data & translate agents
+
+- `data_approval_pending` carries `items: [{ table, records: [ …rows… ] }]`; apply with
+  `PUT {apiBase}{db}/ai/data` and the same body. `remainingTables[]` lists tables the model has not
+  generated yet — call `POST {db}/ai/data` again with the same `responseID` to get the rest.
+- `translation_approval_pending` carries `items: [{ table, locale, scope }]`, where `scope: "records"`
+  translates row values and `scope: "schema"` creates translation **labels** for slugs/keys
+  (it never renames anything). Apply with `PUT {apiBase}{db}/ai/translate`.
+
+### 11.6 Dashboards agent
+
+`POST {apiBase}{db}/ai/dashboards` proposes dashboards/widgets, or `dashboards_delete_pending` with
+`deleteIDs` when the user asks to remove some. Proposals are sanitized server-side: unknown widget
+types, enum violations and references to non-existent tables/fields are dropped rather than persisted,
+and slug/key references are converted to the **ids** the front-end stores (§12.2).
+Apply with `PUT {apiBase}{db}/ai/dashboards`; the response also returns the refreshed `dashboards` list.
+
+---
+
+## 12. Dashboards & widgets
+
+### 12.1 The `dashboards` table
+
+Schema (created automatically for new databases, and defensively re-created by the AI apply endpoint
+for older ones): `{ name (required), description, icon, widgets (json) }`.
+Built-in flow: reads are open to any session, writes require role `1` (admin) — the same guard the
+CMS UI uses, so `POST`/`PUT`/`DELETE` fail with `code: "accessDenied"` for a normal user. Data
+endpoints are in §10.4; the admin screens are `/admin/dashboards` and `/admin/dashboards/{id}`
+(any signed-in user can open them; the create/edit/delete actions in the UI are shown only to the
+super-admin).
+
+### 12.2 Widget definition
+
+```ts
+type Widget = {
+  id?: string;
+  icon?: string;                        // tabler icon name
+  type: "counter" | "line" | "bar" | "pie" | "table";
+  title?: string;
+  table?: string;                       // source table ID (not slug)
+  field?: string | number;              // field ID (not key) the widget aggregates
+  operation?: "count" | "sum" | "max" | "min";
+  groupBy?: string | number;            // field ID
+  dateField?: string | number;          // field ID, or the reserved keys createdAt / updatedAt
+  dateRange?: "7d" | "30d" | "90d" | "1y" | "all";
+  limit?: number;
+  color?: string;
+  size?: "small" | "medium" | "large";
+  searchArray?: SearchType;             // filter (Inison criteria)
+  columns?: (string | number)[];       // field IDs — table widget
+  sortField?: string | number;          // field ID
+  sortOrder?: "asc" | "desc";
+};
+```
+
+> **References are stored as ids, not keys** — that is what keeps a widget working after a table rename
+> or a field-key change. The AI works in slugs/keys and the apply endpoint resolves them to ids.
+
+### 12.3 How widgets read data
+
+| Widget | Mechanism | Cap |
+| --- | --- | --- |
+| `counter` + `count` | `GET {db}/{table}?options={perPage:1,columns:[id]}` → `options.total` | none (server-side count) |
+| `counter` + `sum` | `GET {db}/{table}/sum?columns=<field>` (dotted field ⇒ `nested=true`, §5.6) | none (server-side aggregate) |
+| `counter` + `max` / `min` | fetches up to 1000 rows and aggregates client-side | **1000 rows** |
+| `line` / `bar` / `pie` | `GET {db}/{table}` with `columns`, `sort`, `where`; grouped client-side | **1000 rows** |
+| `table` | `GET {db}/{table}` with `columns`, `sort`, `limit` | `limit` |
+
+So: for exact totals prefer a **computed column** (`sum(...)`) or the `sum` operation; only `sum` and
+`count` are exact on large tables.
+
+---
+
+## 13. Realtime (WebSocket)
+
+Tables with `config.realtime: true` broadcast every change over a WebSocket.
+
+```
+PUT {apiBase}inicontent/databases/{db}/{table}      body: { …existing, config: { …, realtime: true } }
+```
+Reads on such a table then carry the header `X-Realtime-Enabled: true`.
+
+### 13.1 Connecting
+
+```
+wss://api.inicontent.com/realtime        // host = the host of apiBase
+```
+The session is taken from the **upgrade request**: the `{db}_sid` query param or the `{db}_sid` cookie,
+e.g. `wss://api.inicontent.com/realtime?myapp_sid=<session-id>`.
+
+### 13.2 Subscribe / unsubscribe
+
+```json
+{ "type": "subscribe", "database": "myapp", "table": "articles" }
+```
+```json
+{ "type": "subscribed", "database": "myapp", "table": "articles",
+  "message": "Subscribed to real-time updates for myapp/articles" }
+```
+```json
+{ "type": "unsubscribe" }
+```
+
+> The session is resolved **server-side from the upgrade request**; a `sessionId` field inside the
+> message is ignored. A rejected subscription receives `{"type":"error","message":"…"}` and the socket is
+> closed with code `4403` (deny-by-close).
+
+### 13.3 Events
+
+```json
+{ "type": "data_change", "action": "create", "database": "myapp",
+  "table": "articles", "data": { "id": "…", "title": "…" }, "timestamp": "2025-01-01T00:00:00.000Z" }
+```
+`action` is `create`, `update` or `delete`. Creates, updates, deletes, reverts, imports and exports all
+broadcast when the table has realtime enabled. Row visibility is filtered **per subscriber** using the
+read scope resolved at subscribe time, so a restricted user only receives rows their flows allow.
+
+---
+
+## 14. Routing / admin surface
 
 Routes provided by the layer (all under the optional `{databaseSlug}` segment).
 
@@ -635,23 +1235,42 @@ When not configured, each database is namespaced: `/{databaseSlug}/admin/...`.
 | Route | Purpose |
 | --- | --- |
 | `/admin` | table list / dashboard for the configured DB |
+| `/admin/tables` | table grid for the database |
 | `/admin/tables/{table}` | data grid for a table (search, filter, sort, paginate) |
 | `/admin/tables/{table}/{id}` | view an item |
 | `/admin/tables/{table}/{id}/edit` | edit an item |
+| `/admin/tables/{table}/new` | create an item |
+| `/admin/tables/{table}/settings` | table settings (schema, config, allowed methods) |
+| `/admin/tables/{table}/flows` | `onRequest` / `onResponse` editor |
+| `/admin/tables/{table}/schedules` | scheduled actions |
+| `/admin/tables/assets/**` | asset library (nested folders) + its own flows page |
+| `/admin/tables/pages` · `/admin/tables/blocks` · `/admin/tables/templates` | the content-building system tables |
+| `/admin/tables/backups` | database-level backups & restore (super-admin) |
 | `/admin/api` | API documentation for your DB (also lists public read endpoints per table) |
-| `/admin/api/tables/{table}` | per-table CRUD docs (JSON-LD endpoint map) |
-| `/admin/settings` | database settings (SMTP, email test, etc.) |
-| `/admin/dashboards`, `/admin/dashboards/{id}` | dashboards (super-admin) |
+| `/admin/api/tables` · `/admin/api/tables/{table}` | per-table CRUD docs (JSON-LD endpoint map) |
+| `/admin/api/auth` | authentication endpoint docs |
+| `/admin/settings` | database settings (SMTP, domains, email test/preview, database export) |
+| `/admin/dashboards`, `/admin/dashboards/{id}` | dashboards (read for any session; create/edit/delete = super-admin) |
+| `/admin/billing` | subscription, invoices, payment method, storage usage |
 | `/auth` | login / signup |
 | `/auth/reset` | password reset |
 | `/api` | public read-only API overview (tables with `allowedMethods` containing `r` and `show !== false`) |
 
+> In the sidebar, app tables come first, then the Dashboards entry, then the secondary system tables
+> (`users`, `sessions`, `assets`, `translations`, `pages`, `blocks`, `templates`) — and **Backups last**,
+> visible only to the super-admin. Backups is a *database-level* surface at `/admin/tables/backups`,
+> not a per-table page.
+>
 > In older builds the table routes used bare paths like `/admin/{table}`; the current convention
 > (used by the layer and by the route examples below) is `/admin/tables/{table}`.
+>
+> The in-app `/admin/api/tables/{table}` page documents list params (`page`, `limit`, `columns`,
+> `search`) that the API does **not** read, and claims a default page size of 25 instead of 15.
+> Use it for the endpoint list, not for the query-param contract (§5.1).
 
 ---
 
-## 11. Building custom interfaces for tables — register each route in `nuxt.config.ts`
+## 15. Building custom interfaces for tables — register each route in `nuxt.config.ts`
 
 **Particularity:** when you build **custom interfaces** for tables (custom pages that override or
 extend the CMS's per-table screens), those routes are **not auto-discovered from the `pages/` folder
@@ -696,7 +1315,8 @@ export default defineNuxtConfig({
 - **Every route must be explicitly pushed** — file-based scanning does **not** pick up per-table override pages.
 - **Non-ASCII table slugs work verbatim** (Arabic examples below: `منتجات`, `عملاء`, `مخزون`, `مهام`, `طلبات`, …). Use the slug exactly as it appears in the database, including spaces (`طلبات الشراء`).
 - **Build the standard sub-route set per table** and register the ones your app uses:
-  `index`, `new`, `[{id}]` (detail), `[{id}]/desc`, `settings`, `flows`, `schedules`.
+  `index`, `new`, `[{id}]` (detail), `[{id}]/edit`, `settings`, `flows`, `schedules`.
+  (Backups is **not** per-table — see §14.)
 - **Unique `name` per route** — duplicate names silently drop routes. Note the detail page naming
   convention below: the plain table name is used for the index, and detail uses a `-id` suffix;
   a nested resource detail can use a `desc-` prefix.
@@ -772,58 +1392,87 @@ export default defineNuxtConfig({
 
 ---
 
-## 12. AI agent operating procedure (do this every time)
+## 16. AI agent operating procedure (do this every time)
 
 1. **Ask the user** for: database slug, username, password. (Never invent or guess them.)
 2. **Authenticate** with `PUT {apiBase}{db}/auth/signin` → capture `result.sessionID`.
-3. **Verify** the session with `GET {apiBase}{db}/auth/current`.
+3. **Verify the session** with `GET {apiBase}{db}/auth/current`.
 4. **Discover** the schema: `GET {apiBase}inicontent/databases/{db}` → read `tables[*].schema` (§7),
-   `tables[*].onRequest/onResponse` flows (§8), `roles`, `allowedMethods`.
+   `tables[*].onRequest/onResponse` flows (§9), `roles`, `allowedMethods`, `config` (§4.1) and
+   `size`. Note every **computed** column (`field.computed`) — its value is engine-owned (§8).
 5. **Plan** the app/pages against the real table slugs, field names and flows found in step 4.
 6. **Design structure when needed**: create/edit tables, schemas and flows via the meta endpoints
-   (§9), following the canonical schema rules (§7.4); never create a second `users` table. Optionally
-   use the platform AI to draft schemas (§9.3).
+   (§10), following the canonical schema rules (§7.4); never create a second `users` table. Put
+   derived numbers in **computed fields** rather than computing them in the client (§8). Optionally
+   use the platform AI to draft schemas (§11) — it requires an admin session.
 7. **Implement** the app on the starter project (Nuxt layer pattern; register custom table pages in
-   `hooks["pages:extend"]` per §11; pages override CMS routes).
-8. **Verify** your work by reading data back through the same API with the session id.
+   `hooks["pages:extend"]` per §15; pages override CMS routes).
+8. **Aggregate server-side**: totals/counters go through `GET {db}/{table}/sum` (§5.6) — never by
+   summing a paginated page of rows in the client.
+9. **Verify** your work by reading data back through the same API with the session id — and judge every
+   response by its **body** (`result` + `code`), not by the HTTP status (§5.1).
 
 ### Hard rules
 
 - Never log, echo, or store plaintext passwords; use env vars (`INICONTENT_USERNAME`, `INICONTENT_PASSWORD`).
-- Always attach `{db}_sid=<session>` to data requests; a missing/invalid session yields 401/empty results.
+- Judge every API response by its body — `result === null` or a **string** `code` means failure even
+  when the HTTP status is `200` (§5.1).
+- Always attach `{db}_sid=<session>` to data requests; a missing/invalid session yields
+  `authRequired`/`accessDenied` (or an empty `result`).
 - Respect `allowedMethods` per table (`r/c/u/d`) and `show` flags.
 - Set a `locale` (`en` by default) on API calls that return user-facing text.
 - Send pagination/projection in the Inison-stringified **`options`** param (`{page, perPage, columns, sort}`)
-  and filters in the Inison-stringified **`where`** param — endpoints are paginated; there is no separate
-  `page`/`perPage` query param.
-- Custom table interfaces must be registered in `nuxt.config.ts` via `pages:extend` (§11).
+  and filters in the Inison-stringified **`where`** param — endpoints are paginated (default 15 per page);
+  there is no separate `page`/`perPage`/`limit`/`columns` query param.
+- Never send a computed field's key in a create/update body, and never mix `computed` with
+  `required`/`unique`/`regex` (§8).
+- Writing dashboards, backups, domains, database export and **every AI endpoint** need the super-admin
+  role (`idOne`); expect `accessDenied` otherwise (a real `403` on the AI routes, an error body
+  elsewhere). Reading dashboards only needs a session.
+- Custom table interfaces must be registered in `nuxt.config.ts` via `pages:extend` (§15).
 - When editing a table's schema or flows, send the **full** lists (merge first) — a partial `schema`
-  replaces the whole column set, a partial `onRequest`/`onResponse` replaces all flows (§7.4, §8.5).
-- Version: this context targets Nuxt 4 / Inicontent layer from the `inicontent` npm package (current generation).
+  replaces the whole column set, a partial `onRequest`/`onResponse` replaces all flows (§7.4, §9.5).
+- Version: this context targets Nuxt 4 / Inicontent layer 1.0.7 on `inibase` 3.3+ (current generation).
 
 ---
 
-## 13. Troubleshooting
+## 17. Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| `401` / empty `result` on `/auth/current` | wrong username/password, or session not passed |
-| `404` on `inicontent/databases/{db}` | wrong database slug |
+| HTTP 200 but nothing was returned | failures are reported in the body, not the status: `result: null` + a string `code` like `dbNotFound`, `accessDenied`, `notFound` — check `code`, not the HTTP status (§5.1) |
+| `code: "dbNotFound"` on any data path | wrong/unknown database slug (the same body is returned for every route under it) |
+| `code: "authRequired"` or empty `result` on `/auth/current` | wrong username/password, or the session param/cookie is missing |
 | Empty/forbidden table reads | table `show` is false or `allowedMethods` lacks `r` |
 | `{db}_sid` param ignored | session expired — re-run sign-in |
 | Filters/pagination ignored | `options`/`where` must be **Inison-stringified + URL-encoded** (no plain JSON) — see §5.1/§6 |
-| Asset upload fails / no `uploadURL` | two-step flow: first `POST /assets` describes the file, then POST the binary to the returned `uploadURL`; custom endpoints must pass `publicURL` up-front (§5.6) |
-| Custom table page 404s | route not registered in `hooks["pages:extend"]` (§11) or `name` duplicated |
+| Only 15 rows, or `page=2` ignored | `perPage` defaults to **15**; plain `limit`/`page` top-level params are ignored (§5.1) |
+| `/sum` returns `0` for an array column | pass the dotted path **and** `nested=true` (`columns=items.quantity`) — §5.6 |
+| `paramsNotCorrect` on `/sum` | `columns` is missing or empty (it is the only required param) |
+| `COMPUTED_FIELD_SETTABLE` on write | you sent a computed key; strip computed keys from the body (§8.5) |
+| `COMPUTED_FIELD_CONFLICT` on schema save | the field also has `required`/`unique`/`regex` — remove them (§8.6) |
+| `COMPUTED_FIELD_UNKNOWN_FIELD` / `SYNTAX` / `CYCLE` | wrong field id, malformed expression (`3.14` is a path, not a decimal), or fields depending on each other (§8.7) |
+| `COMPUTED_FIELD_INVALID_TARGET` on a child field | a computed child must be `type: "number"`, reference only siblings of the same array, and use no helper functions (§8.4) |
+| Computed value stale after changing the expression | it is backfilled on schema save; if the save failed, the old schema is still in place (check for a `COMPUTED_FIELD_*` error) |
+| `missingLogId` / `noLogsFound` on `revert` | the table has no `config.log`, or the body/log id is wrong (§5.8) |
+| WebSocket subscribes but no events arrive | `config.realtime` is off for that table, or the session in the upgrade request is missing/expired (§13) |
+| WebSocket closes with `4403` | the session is not allowed to read that table (`allowedMethods`/flows) |
+| `POST /assets/import` → `noStorageConfigured` | no S3/local storage configured for the deployment |
+| Import/export → `unsupportedFormat` | only `.csv` and `.json` are supported; send the file name via `x-import-file-name` (§5.8) |
+| AI endpoint → `accessDenied` | AI endpoints (and dashboard writes, backups, export, domains) require the DB owner/admin role (`idOne`) |
+| `GET {db}/{table}/schema` → 404 | there is no GET on that path — read the schema from `GET inicontent/databases/{db}` (§10.1) |
+| `/auth/signup` → 404 | signup is `POST {db}/users` (the in-app auth docs page is out of date) (§3.4) |
+| Custom table page 404s | route not registered in `hooks["pages:extend"]` (§15) or `name` duplicated |
 | Table update wiped some fields | the `schema` PUT replaces the whole field list — merge existing fields first (§7.4) |
-| Flow rule seems ignored | a false condition aborts the flow; `[null,null,null]` is a no-op; check field ids/keys against the schema (§8) |
-| `PUT {db}/ai/tables` → 403 | applying AI tables requires the DB owner/admin role (`idOne`) |
+| Schema PUT returned 200 but nothing changed | the table is `users`, `pages` or `blocks` and the new schema dropped a built-in key (`username`/`email`/`password`/`role`/`createdBy`, `slug`/`content`/`seo`, `name`/`config`/`hideOn`) — the update is silently skipped (§10.1) |
+| Flow rule seems ignored | a false condition aborts the flow; `[null,null,null]` is a no-op; check field ids/keys against the schema (§9); super-admin sessions bypass flows entirely |
 | Arabic/spaced slugs 404 | push entries verbatim — do not URL-encode the `path`/`name`; encode only when navigating via links |
 | Port 3434 already in use | `pnpm dev` binds 3434 by design (INIc binary); stop the other process |
-| RSS of session cookie missing in browser | the SPA stores `{db}_sid` per database; check that cookie on API calls from `$fetch` |
+| Session cookie missing in the browser | the SPA stores `{db}_sid` per database; check that cookie on API calls from `$fetch` |
 
 ---
 
-## 14. Quick reference (env + endpoints cheatsheet)
+## 18. Quick reference (env + endpoints cheatsheet)
 
 ```dotenv
 # .env
@@ -834,27 +1483,56 @@ database=myapp
 
 ```text
 Sign in      PUT  {apiBase}{db}/auth/signin                 {username,password}
+Sign out     GET  {apiBase}{db}/auth/signout
 Current      GET  {apiBase}{db}/auth/current                {db}_sid=<sid>
 DB metadata  GET  {apiBase}inicontent/databases/{db}        {db}_sid=<sid>
+DB list      GET  {apiBase}inicontent/databases
 List         GET  {apiBase}{db}/{table}?options={page,perPage,columns,sort}&where={...}&locale&{db}_sid
 One          GET  {apiBase}{db}/{table}/{id}
-Create       POST {apiBase}{db}/{table}
-Update       PUT  {apiBase}{db}/{table}/{id}
-Delete       DELETE {apiBase}{db}/{table}/{id}
+Sum          GET  {apiBase}{db}/{table}/sum?columns=<col|nested.path>&nested=true&where={...}
+Create       POST {apiBase}{db}/{table}                     → code 201
+Update       PUT  {apiBase}{db}/{table}/{id}                (add ?return=false for `true`)
+Delete       DELETE {apiBase}{db}/{table}/{id}              → code 204
+Logs         GET  {apiBase}{db}/{table}/logs                (needs config.log)
+Revert       POST {apiBase}{db}/{table}/{id}/revert         {logId}
+Schedules    GET/POST {apiBase}{db}/{table}/schedules  ·  POST .../schedules/preview
+             PUT/DELETE .../schedules/{id}  ·  POST .../schedules/{id}/run
 Assets       POST {apiBase}{db}/assets  →  response.uploadURL  →  POST/PUT binary to uploadURL
+Assets by URL POST {apiBase}{db}/assets/import               ["https://…"]
+Backups      GET/POST {apiBase}{db}/backups  ·  POST .../backups/{id}/restore {scope,confirm:true}
+SEO          GET  {apiBase}{db}/seo/{sitemap.xml|robots.txt|feed.xml|schema.json}
+Realtime     wss://{apiHost}/realtime  →  {"type":"subscribe","database","table"}
 Flows        PUT  {apiBase}inicontent/databases/{db}/{table}   body {onRequest,onResponse}
-New table    POST {apiBase}inicontent/databases/{db}/{table}   body {schema,icon,label}
+New table    POST {apiBase}inicontent/databases/{db}/{table}   body {schema,config,icon,label}
 Edit table   PUT  {apiBase}inicontent/databases/{db}/{table}   body {schema,onRequest,onResponse,...}
 Delete table DELETE {apiBase}inicontent/databases/{db}/{table}
-AI draft     POST {apiBase}{db}/ai/tables                      → tables_approval_pending
-AI apply     PUT  {apiBase}{db}/ai/tables                      (admin only)
+Item schema  POST/PUT {apiBase}{db}/{table}/schema            (no GET)
+DB export    POST/GET {apiBase}inicontent/databases/{db}/export  ·  GET .../export/download
+Domains      POST {apiBase}inicontent/databases/{db}/domains   {domainName}  ·  GET/DELETE .../domains/{name}
+Email        POST {apiBase}inicontent/databases/{db}/email/{test|preview}
 
-Custom table routes (register each explicitly)
-  index      { path: "/admin/tables/{table}",            file: "~/pages/admin/tables/{table}/index.vue" }
-  new        { path: "/admin/tables/{table}/new",        file: "~/pages/admin/tables/{table}/new.vue" }
-  detail     { path: "/admin/tables/{table}/:id",        file: "~/pages/admin/tables/{table}/[id]/index.vue" }
-  desc       { path: "/admin/tables/{table}/:id/desc",   file: "~/pages/admin/tables/{table}/[id]/desc.vue" }
-  settings   { path: "/admin/tables/{table}/settings",   file: "~/pages/admin/tables/{table}/settings.vue" }
-  flows      { path: "/admin/tables/{table}/flows",      file: "~/pages/admin/tables/{table}/flows.vue" }
-  schedules  { path: "/admin/tables/{table}/schedules",  file: "~/pages/admin/tables/{table}/schedules.vue" }
+Dashboards   GET/POST {apiBase}{db}/dashboards  ·  PUT/DELETE {apiBase}{db}/dashboards/{id}
+
+AI (all admin-only, propose → apply)
+  route      POST {apiBase}{db}/ai                     {message,responseID?}         → redirect target
+  tables     POST {apiBase}{db}/ai/tables              {message,existingTables?}      → tables_approval_pending
+             PUT  {apiBase}{db}/ai/tables              {tables:[{slug,schema}]}      → {results,tables}
+             DELETE {apiBase}{db}/ai/tables            {tables:[slug]}               → {results}
+  data       POST {apiBase}{db}/ai/data                {message,existingTables?}      → data_approval_pending
+             PUT  {apiBase}{db}/ai/data                {items:[{table,records}]}     → {results}
+  content    POST {apiBase}{db}/ai/content             {table,count,topic,step,…}    → outline_ready|content_approval_pending
+  dashboards POST {apiBase}{db}/ai/dashboards          {message,existingTables?}      → dashboards_approval_pending
+             PUT  {apiBase}{db}/ai/dashboards          {dashboards:[…]}              → {results,dashboards}
+             DELETE {apiBase}{db}/ai/dashboards        {ids:[…]}                     → {results}
+  pages      POST {apiBase}{db}/ai/pages               {message,slugPrefix?}         → structure_generated
+  translate  POST/PUT {apiBase}{db}/ai/translate       {message} / {items}           → translation_approval_pending
+  databases  POST {apiBase}{db}/ai/databases           {message}                     → database_approval_pending
+
+Computed expression cheatsheet (ids, not keys — see §8)
+  sum(count|avg|min|max)(expr)   iterate an array-of-objects column, per element
+  + - * / %  and  ( )            arithmetic;  * / % bind tighter than + -
+  3.4                             field 4 of the row linked by field 3 (must be type "table")
+  314 / 100                       the number 3.14 — there are no decimal literals
+  5 * 6                           field 5 × field 6 (any integer that matches a field id IS that field)
+  Computed children: type "number", sibling references only, no helpers; aggregate with nested=true
 ```

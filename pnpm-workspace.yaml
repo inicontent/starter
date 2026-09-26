@@ -1,0 +1,7 @@
+allowBuilds:
+  canvas: false
+  core-js: false
+  esbuild: false
+  inicontent: true
+  re2: false
+  tesseract.js: false

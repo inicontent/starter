@@ -7,9 +7,20 @@ installed from the `inicontent` npm package. It gives you, out of the box:
 - The full CMS admin UI — table grids, item forms, flows, settings, API docs (`/admin`).
 - A per-database **REST API** served at `https://api.inicontent.com/{databaseSlug}/{table}`
   (authenticate with `PUT {databaseSlug}/auth/signin`, then pass the `{databaseSlug}_sid` session).
+- **Computed fields** — engine-derived columns you declare in the schema (`total: sum(5 * 6)`),
+  recalculated on every write, read-only, and backfilled for existing rows.
+- **Dashboards & widgets** — saved counters, charts and table panels, plus a **realtime**
+  WebSocket change feed per table.
+- **Backups & restore** (full or per-table, with scoped restore), **database export**,
+  and **SEO artifacts** (`sitemap.xml`, `feed.xml`, `robots.txt`, JSON-LD) derived from a
+  per-table `config.content` declaration.
+- **AI assistant endpoints** under `{databaseSlug}/ai/*` that draft schemas, data, translations,
+  pages, dashboards and long-form content for you to review and apply.
 - A place for your own pages under `pages/` that **override** the CMS routes.
 - **[`CONTEXT.md`](CONTEXT.md)** — the AI-agent build context: authentication, REST API,
-  query language, table schemas & flows, and how to register custom table routes.
+  query language, table schemas & flows, computed fields, dashboards, realtime, and how to
+  register custom table routes.
+- **[`AGENTS.md`](AGENTS.md)** — the short brief every agent should read before it starts.
 
 ## Setup
 
@@ -104,7 +115,7 @@ bun run preview
 - **Remove `app.vue`** — the layer provides its own.
 - Add your own files under `pages/`: they **override** the CMS routes of the same name.
 - Per-table screens are **not auto-discovered** from `pages/` — register every custom table route
-  explicitly in `nuxt.config.ts` via `hooks["pages:extend"]` (see `CONTEXT.md` §11).
+  explicitly in `nuxt.config.ts` via `hooks["pages:extend"]` (see `CONTEXT.md` §15).
 - Reusable code goes in `components/`, `composables/`, `layouts/` as in any Nuxt app.
 - **Read [`CONTEXT.md`](CONTEXT.md) before building** — it documents authentication, the REST API,
   the Inison query language, table schemas, flows, and the route-registration rules the AI and
