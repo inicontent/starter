@@ -4,7 +4,7 @@
 > using the **[inicontent/starter](https://github.com/inicontent/starter)** project, including
 > authenticated access to the user's database through the Inicontent REST API.
 >
-> Verified against `inicontent` **1.0.7** (layer), `inibase` **3.3+** (engine, computed fields),
+> Verified against `inicontent` **1.1.0** (layer), `inibase` **3.3+** (engine, computed fields),
 > and the current public API.
 
 ---
@@ -35,7 +35,8 @@ Key concepts:
 - **Field / Schema** — the column/type definition of a table (string, number, email, password, table ref, arrays, objects, dates…).
 - **Item / Row** — a single record in a table. Every item has an `id` and often `createdBy`, timestamps, etc.
 - **Roles** — each user has a `role` id. The **super-admin role id** is `idOne`
-  (default `d7b3d61a582e53ee29b5a1d02a436d55`); it gates dashboard/role-management features **and every AI endpoint**.
+  (default `d7b3d61a582e53ee29b5a1d02a436d55`); it gates dashboard/role-management features
+  and the admin-only writes (backups, export, domains).
 - **allowedMethods** — per-table permission string; letters `r` (read), `c` (create), `u` (update), `d` (delete).
   Respect it: a table with `allowedMethods: "r"` is read-only.
 - **System tables** — a new database ships with `users`, `sessions`, `assets`, `translations`, `pages`,
@@ -65,9 +66,10 @@ export default defineNuxtConfig({
   extends: ["inicontent"],
 })
 ```
-- The layer is resolved from the `inicontent` version pinned in `package.json` (current generation: **1.0.7**).
+- The layer is resolved from the `inicontent` version pinned in `package.json` (current generation: **1.1.0**).
 - Upgrading to a new CMS release is `pnpm up inicontent` (or `npm update inicontent`) followed by a rebuild.
-- Pin `^1.0.7` (or newer) to get computed fields, dashboards and the current admin surface.
+- Pin `^1.1.0` (or newer) for the current admin surface, dashboards and override-aware table
+  navigation; per-table override files themselves work from **1.0.5** (§15).
 
 ### Setup & run
 
@@ -100,8 +102,10 @@ database=myapp
 
 ### Layout rules of a layer app
 
-- **Remove `app.vue`** so the layer's own `app.vue` is used (the starter has no `app.vue`).
-- Add your own files under `pages/`: they **override** the CMS routes of the same name.
+- **Remove `app/app.vue`** so the layer's own `app.vue` is used (the starter has no `app.vue`).
+- Add your own files under `app/pages/`: they **override** the CMS routes of the same name. Custom
+  per-table screens are just files too — `app/pages/admin/tables/<tableSlug>/…`, no route
+  registration step (§15).
 - Reusable code goes in `components/`, `composables/`, `layouts/` as in any Nuxt app.
 
 ---
@@ -336,7 +340,7 @@ engine's page info (`page`, `perPage`, `total`, and `totalPages`).
 > `result` is `null`. On success `code` is a **number** (`200`, `201`, `202`, `204`).
 > So: treat `result === null` (or a non-numeric `code`) as the failure signal.
 >
-> A few routes — the AI endpoints, schema validation — throw instead and answer with a **real HTTP
+> A few routes — schema validation — throw instead and answer with a **real HTTP
 > status** (`401 authRequired`, `403 accessDenied`, `400 emptyBody`). Handle both shapes.
 
 ### 5.2 Get one item
@@ -602,9 +606,10 @@ Widgets (`subType` and CMS-specific forms — the *data* you send stays plain):
 > When **creating** items, send plain values: strings for `select`/`radio`, arrays for
 > `tags`/`checkbox`/`array-*`, IDs for `table` refs, objects/arrays for `object`/`array`.
 
-### 7.4 Canonical schema rules (the same rules the platform AI uses — apply them when you design tables)
+### 7.4 Canonical schema rules (apply them when you design tables)
 
-These come from the AI prompt embedded in the API (`{apiBase}{db}/ai/tables`, §11.3):
+These are the conventions the platform itself uses — an agent connected through the MCP server
+(`@inicontent/mcp`, §11) is told the same rules:
 
 1. **Editing** an existing table → send the **full** schema (existing fields + new/modified ones).
    A partial `schema` **replaces** the whole field list on update — always merge first.
@@ -1003,125 +1008,85 @@ each table's `config.content` declaration (§4.2), and records are read **throug
 
 ---
 
-## 11. AI endpoints (the platform's built-in assistant)
+## 11. The MCP server (`@inicontent/mcp`) — how code agents drive Inicontent
 
-The CMS ships an AI assistant with endpoints under `{apiBase}{db}/ai` (the `{db}` segment is the
-database the assistant is working on — including a database that was just created by
-`POST {db}/ai/databases`). Use them to design a database with the same conventions as the CMS itself.
+The in-app AI assistant (the `{apiBase}{db}/ai` endpoints) and the in-app chatbot were **removed**.
+AI is now provided by a standalone Model Context Protocol server, **`@inicontent/mcp`**, that code
+agents — ChatGPT, Claude, Cursor, OpenCode, Windsurf, Cline, VS Code — attach to. The server gives
+the agent **tools** that call the exact REST API documented in this file, plus **resources** that
+carry its operating rules, so it never has to guess the conventions above.
 
-### 11.1 General rules
-
-- **Admin-only:** every AI endpoint requires the caller's `role` to equal `idOne` — otherwise
-  `403 accessDenied`. A non-admin session cannot use the assistant at all.
-- **Rate-limited** per user; a session cookie/query param is mandatory (`401 authRequired` without one).
-- **Conversation threading:** every request accepts `responseID` (returned by the previous call) and
-  sends it back as `previous_response_id` to keep the model's context.
-- **Envelope:** each call answers
-  ```json
-  { "responseID": "resp_…", "response": { "action": "…", "message": "…", /* action-specific fields */ } }
-  ```
-  The action-specific payload is described per endpoint below.
-- **Context:** pass `existingTables` (the `tables[]` array from §4) so the model works against the real
-  schema instead of guessing.
-- **Propose → apply:** `POST` endpoints only *propose*; the matching `PUT`/`DELETE` endpoint *applies*
-  what the user approved. Never apply an unapproved proposal.
-- **Protected tables** (rejected by the apply endpoints): `users`, `sessions`, `assets`, `translations`,
-  `pages`, `blocks`, `dashboards`, `templates`, `backups`, `passkey_credentials`, `passkey_challenges`.
-
-| Endpoint | Method & path | Body | Response `response.action` |
-| --- | --- | --- | --- |
-| Router | `POST {apiBase}{db}/ai` | `{ message, responseID? }` | `redirect` (with `target`), `greeting`, `rejected` |
-| Tables | `POST {apiBase}{db}/ai/tables` | `{ message, responseID?, existingTables?, step?, approvedTables? }` | `clarification_needed` (`questions[]`), `tables_naming_pending`, `tables_approval_pending` (`tables[]`), `tables_delete_pending`, `roles_defined` (`roles[]`), `greeting`, `rejected`, `completed` |
-| Tables (apply) | `PUT {apiBase}{db}/ai/tables` | `{ tables: [{ slug, schema?, icon?, label? }] }` | `{ results: [{ slug, action: "created"\|"updated", success, error? }], tables[] }` |
-| Tables (delete) | `DELETE {apiBase}{db}/ai/tables` | `{ tables: [slug] }` | `{ results: [{ slug, success, error? }] }` |
-| Data | `POST {apiBase}{db}/ai/data` | `{ message, responseID?, existingTables? }` | `data_approval_pending` (`items: [{ table, records[] }]`, `remainingTables[]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
-| Data (apply) | `PUT {apiBase}{db}/ai/data` | `{ items: [{ table, records[] }] }` | `{ results: [{ table, count, success, error? }] }` |
-| Pages | `POST {apiBase}{db}/ai/pages` | `{ message, responseID?, slugPrefix?, existingTables?, reusableBlocks? }` | `structure_generated`, `content_generated`, `images_generated`, `clarification_needed`, `greeting`, `rejected`, `completed` |
-| Translate | `POST {apiBase}{db}/ai/translate` | `{ message, responseID?, existingTables?, primaryLanguage?, secondaryLanguages? }` | `translation_approval_pending` (`items: [{ table, locale, scope?: "records"\|"schema" }]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
-| Translate (apply) | `PUT {apiBase}{db}/ai/translate` | `{ items: [{ table, locale, scope? }] }` | `{ results: [...] }` |
-| Databases | `POST {apiBase}{db}/ai/databases` | `{ message, responseID? }` | `database_approval_pending` (`database: { slug, primaryLanguage?, secondaryLanguages?, primaryColor?, tablesPrompt? }`), `clarification_needed`, `greeting`, `rejected` |
-| Dashboards | `POST {apiBase}{db}/ai/dashboards` | `{ message, responseID?, existingTables?, existingDashboards? }` | `dashboards_approval_pending` (`dashboards[]`), `dashboards_delete_pending` (`deleteIDs[]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
-| Dashboards (apply) | `PUT {apiBase}{db}/ai/dashboards` | `{ dashboards: [{ id?, name, description?, icon?, widgets? }] }` | `{ results: [{ id, name, action: "created"\|"updated", success, error? }], dashboards[] }` |
-| Dashboards (delete) | `DELETE {apiBase}{db}/ai/dashboards` | `{ ids: [id] }` (or `deleteIDs`) | `{ results: [{ id, success, error? }] }` |
-| Content | `POST {apiBase}{db}/ai/content` | `{ table, count?, topic?, audience?, tone?, length?, keywords?, fields?, step?, responseID?, content?, title? }` | `outline_ready` (`outlines[]`), `content_approval_pending` (`records: [{ values, outline?, pending? }]`, `remaining[]`), `clarification_needed`, `greeting`, `rejected`, `completed` |
-
-### 11.2 Router
-
-`POST {apiBase}{db}/ai` classifies the request and tells the client where to continue:
-
-```json
-{ "responseID": "resp_…", "response": { "action": "redirect", "target": "tables" } }
+```sh
+npm install -g @inicontent/mcp
+inicontent-mcp login            # stores the session id locally (password never persisted)
+inicontent-mcp                  # stdio transport for local desktop agents
+# or, for web/ChatGPT-style clients (Streamable HTTP on 127.0.0.1:3000):
+inicontent-mcp http
 ```
 
-`target` is one of `tables`, `data`, `pages`, `translate`, `databases`, **`dashboards`**.
-(`greeting` short-circuits without a model call on a fresh conversation; `rejected` means the request
-was out of scope.)
+Remote clients authenticate with `Authorization: Bearer <database>:<sessionID>` — the bearer is
+verified against `auth/current` (§3.3) on **every** request. Mint one without storing anything:
 
-### 11.3 Tables agent
-
-`POST {apiBase}{db}/ai/tables` embeds the canonical schema rules quoted in §7.4, so its proposals
-follow them. `tables_approval_pending` returns full table proposals:
-
-```json
-{ "response": { "action": "tables_approval_pending", "tables": [
-  { "slug": "orders", "icon": "shopping-cart", "isNew": true,
-    "schema": [ /* Field[] — may include `computed` expressions (§8) */ ],
-    "demo": [ /* sample rows */ ] }
-] } }
-```
-- `step` drives the naming pass: `tables_naming_pending` proposes slugs/labels first; send the accepted
-  names back as `approvedTables` to get schemas.
-- `roles_defined` returns `roles: [{ role, permissions: [{ table, allowedMethods }] }]`.
-- Apply with `PUT {apiBase}{db}/ai/tables` (`{ tables: [{ slug, schema, icon?, label? }] }`), which
-  creates/updates in one call and reports per-table success.
-- Delete with `DELETE {apiBase}{db}/ai/tables` (`{ tables: [slug] }`); protected tables come back as
-  `{ success: false, error: "Cannot delete protected system table" }` without aborting the batch.
-
-### 11.4 Content agent (long-form generation)
-
-`POST {apiBase}{db}/ai/content` generates long-form text for **any** table that has long-text columns:
-
-```jsonc
-// 1) plan
-{ "table": "articles", "count": 5, "topic": "…", "audience": "…",
-  "tone": "professional",            // neutral|conversational|professional|persuasive|technical|friendly|formal
-  "length": "medium",                // short|medium|long  → ~150-300 / 400-700 / 900-1400 words
-  "keywords": ["…"], "fields": ["title", "body"], "step": "outline" }
-// → { "response": { "action": "outline_ready", "outlines": [ … ] } }
-
-// 2) write the first piece, report the rest as pending
-{ …, "step": "draft", "responseID": "resp_…" }
-// → { "response": { "action": "content_approval_pending",
-//                   "records": [{ "values": { "title": "…", "body": "…" } },
-//                               { "values": {}, "pending": true }],
-//                   "remaining": [1, 2, 3, 4] } }
-
-// 3) derive SEO metadata for a body you already hold
-{ "table": "articles", "step": "seo", "title": "…", "content": "<the draft>" }
-// → { "response": { "action": "content_approval_pending", "records": [{ "values": { … } }] } }
+```sh
+inicontent-mcp login --username ada --password '…' --database myapp --print-token
+# → myapp:6f9c…   (slug:sessionID, valid for the session's 30-day lifetime)
 ```
 
-- Only long-text columns are generated for; a table without them answers `noContentFields`.
-- `count` is capped (max 20 records per call) and the table must not be protected.
-- The agent only **proposes**: write the approved values with
-  `PUT {apiBase}{db}/ai/data` as `{ items: [{ table, records: [values] }] }` (§11.5) or plain table writes.
+### 11.1 What the agent gets
 
-### 11.5 Data & translate agents
+- **~27 `inicontent_*` tools**, grouped as:
+  - **Auth & discovery** — `inicontent_signin`, `inicontent_whoami`, `inicontent_list_databases`,
+    `inicontent_describe_database`, `inicontent_describe_table`.
+  - **Data** — `inicontent_list_items` (with `where`/`sort`/`columns`/`locale`, i.e. the `options`
+    and `where` params of §5.1/§6), `get_item`, `create_items`, `update_items`, `delete_items`,
+    `search_items`, `sum_column`.
+  - **Schema & flows** — `inicontent_create_table`, `inicontent_update_table`, `inicontent_set_flows`
+    (the meta endpoints of §10, merging rules of §7.4 baked into the tool), `delete_table`.
+  - **Assets & dashboards** — `upload_asset` (the two-step flow of §5.7 handled internally),
+    `import_asset_from_url`, `list_assets`, `list_dashboards`, `save_dashboard`.
+  - **Projects (custom code)** — `create_project`, `list_projects`, `list_project_files`,
+    `read_file`, `write_file`, `search_project` (see §11.4).
+- **Three context resources** the agent reads on start:
+  - `inicontent://context/hard-rules` — the non-negotiables of §16 ("hard rules").
+  - `inicontent://context/query-language` — the inison `where`/`options` syntax of §6.
+  - `inicontent://context/schema-rules` — the canonical schema rules of §7.4.
+- **Server-side serialization:** the agent passes plain JSON objects for `where` and `options`;
+  the server inison-stringifies and URL-encodes them (agents get this wrong constantly).
 
-- `data_approval_pending` carries `items: [{ table, records: [ …rows… ] }]`; apply with
-  `PUT {apiBase}{db}/ai/data` and the same body. `remainingTables[]` lists tables the model has not
-  generated yet — call `POST {db}/ai/data` again with the same `responseID` to get the rest.
-- `translation_approval_pending` carries `items: [{ table, locale, scope }]`, where `scope: "records"`
-  translates row values and `scope: "schema"` creates translation **labels** for slugs/keys
-  (it never renames anything). Apply with `PUT {apiBase}{db}/ai/translate`.
+### 11.2 What "full API access" means
 
-### 11.6 Dashboards agent
+Every tool maps 1:1 to the REST API in this document and honours the same rules: the response
+envelope of §5.1 (numeric `code` = success, string `code` = failure), `{db}_sid` on data requests,
+`allowedMethods`/`show` enforcement, and the admin-only gates on dashboard writes, backups, export
+and domains. A session that dies mid-conversation is silently re-signed-in once when credentials
+are configured.
 
-`POST {apiBase}{db}/ai/dashboards` proposes dashboards/widgets, or `dashboards_delete_pending` with
-`deleteIDs` when the user asks to remove some. Proposals are sanitized server-side: unknown widget
-types, enum violations and references to non-existent tables/fields are dropped rather than persisted,
-and slug/key references are converted to the **ids** the front-end stores (§12.2).
-Apply with `PUT {apiBase}{db}/ai/dashboards`; the response also returns the refreshed `dashboards` list.
+### 11.3 Designing tables & content
+
+To design tables the agent either reads the existing schema with `inicontent_describe_database`
+(then edits via `inicontent_update_table`, sending **full** merged `schema`/`onRequest`/
+`onResponse` lists), or asks the user for a description and builds a new schema with
+`inicontent_create_table` — the tool validates against §7.4 (no second `users`, no computed fields
+combined with `required`/`unique`/`regex`, `unique`/`required` only on top-level fields, etc.).
+Long-form or translated content is written with `inicontent_create_items`/`update_items` into the
+real tables, exactly as §5.3/§5.4 describe.
+
+### 11.4 Requests that need custom code
+
+When the request needs a page, component or module rather than data, the agent runs
+`inicontent_create_project`: it downloads `inicontent/starter`, rewrites it for the target
+database (`.env` with `NUXT_PUBLIC_DATABASE`/`NUXT_PUBLIC_API_BASE`), and `git init`s the result
+in the server's workspace (`INICONTENT_MCP_WORKSPACE`). Afterwards it edits files through
+`inicontent_write_file`/`read_file` — custom table pages follow §15 exactly
+(`app/pages/admin/tables/<tableSlug>/…`). File tools are jailed to the workspace root.
+
+### 11.5 Security
+
+The server never runs a shell and never executes untrusted input (`git init/add/commit` is the
+only subprocess, with fixed arguments). Credentials are never stored: `login` persists only the
+session id in `~/.config/inicontent-mcp/config.json` (mode `0600`). The remote transport verifies
+the bearer against the session on each request, so a leaked token expires with the session, not
+the process. Full per-client configuration snippets live in the package README.
 
 ---
 
@@ -1129,8 +1094,8 @@ Apply with `PUT {apiBase}{db}/ai/dashboards`; the response also returns the refr
 
 ### 12.1 The `dashboards` table
 
-Schema (created automatically for new databases, and defensively re-created by the AI apply endpoint
-for older ones): `{ name (required), description, icon, widgets (json) }`.
+Schema (created automatically for new databases, and defensively re-created for older ones):
+`{ name (required), description, icon, widgets (json) }`.
 Built-in flow: reads are open to any session, writes require role `1` (admin) — the same guard the
 CMS UI uses, so `POST`/`PUT`/`DELETE` fail with `code: "accessDenied"` for a normal user. Data
 endpoints are in §10.4; the admin screens are `/admin/dashboards` and `/admin/dashboards/{id}`
@@ -1264,131 +1229,106 @@ When not configured, each database is namespaced: `/{databaseSlug}/admin/...`.
 > In older builds the table routes used bare paths like `/admin/{table}`; the current convention
 > (used by the layer and by the route examples below) is `/admin/tables/{table}`.
 >
+> These are the layer's *generic* table routes, all dynamic (`[table]`, `[id]`). A statically
+> named page in your app — `app/pages/admin/tables/<slug>/…` — outranks them and replaces the
+> matching screen; see §15.
+>
 > The in-app `/admin/api/tables/{table}` page documents list params (`page`, `limit`, `columns`,
 > `search`) that the API does **not** read, and claims a default page size of 25 instead of 15.
 > Use it for the endpoint list, not for the query-param contract (§5.1).
 
 ---
 
-## 15. Building custom interfaces for tables — register each route in `nuxt.config.ts`
+## 15. Building custom interfaces for tables — override by file path
 
-**Particularity:** when you build **custom interfaces** for tables (custom pages that override or
-extend the CMS's per-table screens), those routes are **not auto-discovered from the `pages/` folder
-alone**. You must **register every new route explicitly** inside `hooks["pages:extend"]` by pushing
-route objects into Nuxt's `pages` array.
+**No configuration is required.** Every CMS table route is *dynamic*
+(`[[database]]/admin/tables/[table]/…`), so a page file at a **static** path in your app wins:
+Nuxt registers it as its own route, and vue-router ranks a static segment above a dynamic one.
+Creating `app/pages/admin/tables/urgences/index.vue` is all it takes to replace
+`/admin/tables/urgences`.
 
-```ts
-export default defineNuxtConfig({
-  compatibilityDate: "latest",
-  extends: ["inicontent"],
-  hooks: {
-    "pages:extend"(pages) {
-      pages.push(
-        ...[
-          {
-            name: "urgences",                                    // unique route name
-            path: "/admin/tables/urgences",                      // URL path
-            file: "~/pages/admin/tables/urgences/index.vue",     // component file
-          },
-          {
-            name: "traumatoA",
-            path: "/admin/tables/traumatoA",
-            file: "~/pages/admin/tables/traumatoA/index.vue",
-          },
-        ],
-      );
-    },
-  },
-});
-```
+> There is **no** `hooks["pages:extend"]` step, no route-`name` bookkeeping and no
+> `nuxt.config.ts` edit involved. File-based routing handles all of it.
 
-### Route object fields
+### Where the files go
 
-| Field | Value |
-| --- | --- |
-| `name` | Unique vue-router name. Use the table slug; for sub-routes append a suffix (`-settings`, `-new`, `-flows`, `-schedules`, `-id`). |
-| `path` | URL path: `/admin/tables/{tableSlug}` for the table home; sub-routes: `/settings`, `/new`, `/flows`, `/schedules`, `/:id` (detail), `/:id/desc`, `/:id/edit`… |
-| `file` | `~/pages/admin/tables/{tableSlug}/index.vue`. Dynamic segments map to folders: `:id` → `[id]`, so `path: "/admin/tables/مهام/:id"` → `file: "~/pages/admin/tables/مهام/[id]/index.vue"`. |
+Put them under `app/pages/` (the Nuxt 4 `srcDir`), not at the repo root, and **do not** put a
+`[[database]]` segment in the path. The CMS discovers per-table overrides with
+`import.meta.glob("/pages/admin/tables/**/index.vue")`, so a `[[database]]/…` path would not
+match that glob and the CMS would keep treating the table as non-overridden.
+
+### File → route
+
+| File under `app/pages/` | Route it replaces | Purpose |
+| --- | --- | --- |
+| `admin/tables/{slug}/index.vue` | `/admin/tables/{slug}` | data grid for that table |
+| `admin/tables/{slug}/new.vue` | `/admin/tables/{slug}/new` | create an item |
+| `admin/tables/{slug}/[id]/index.vue` | `/admin/tables/{slug}/:id` | item view page |
+| `admin/tables/{slug}/[id]/edit.vue` | `/admin/tables/{slug}/:id/edit` | edit an item |
+| `admin/tables/{slug}/settings.vue` | `/admin/tables/{slug}/settings` | schema, config, allowed methods |
+| `admin/tables/{slug}/flows.vue` | `/admin/tables/{slug}/flows` | `onRequest` / `onResponse` editor |
+| `admin/tables/{slug}/schedules.vue` | `/admin/tables/{slug}/schedules` | scheduled actions |
+
+Add only the screens you want to replace — every file you leave out falls back to the CMS page.
+(Backups is **not** per-table: it is a database-level surface at `/admin/tables/backups` — §14.)
 
 ### Rules to follow
 
-- **Every route must be explicitly pushed** — file-based scanning does **not** pick up per-table override pages.
-- **Non-ASCII table slugs work verbatim** (Arabic examples below: `منتجات`, `عملاء`, `مخزون`, `مهام`, `طلبات`, …). Use the slug exactly as it appears in the database, including spaces (`طلبات الشراء`).
-- **Build the standard sub-route set per table** and register the ones your app uses:
-  `index`, `new`, `[{id}]` (detail), `[{id}]/edit`, `settings`, `flows`, `schedules`.
-  (Backups is **not** per-table — see §14.)
-- **Unique `name` per route** — duplicate names silently drop routes. Note the detail page naming
-  convention below: the plain table name is used for the index, and detail uses a `-id` suffix;
-  a nested resource detail can use a `desc-` prefix.
-- The same hook can **replace** a layer page instead of adding one, by overwriting an existing entry:
+- **The folder name is the table slug, verbatim** — the same string the database uses, spaces
+  and non-ASCII included (`منتجات`, `طلبات الشراء`).
+- **The CMS honours the override in its own UI.** When `…/{slug}/[id]/index.vue` exists, the
+  grid's *view* button navigates to your item page instead of opening the built-in drawer
+  (layer ≥ 1.0.5).
+- **Build links with `tableUrl()`, never a hand-written href.** The router registers a
+  statically-named file under its **percent-encoded** spelling, so non-ASCII slugs must be encoded
+  per segment when you navigate:
   ```ts
-  pages[pages.findIndex(({ name }) => name === "database-admin")].file = resolve(currentDir, "app/pages/[[database]]/admin/index.vue");
+  const { tableUrl } = useTableUrl();
+  // /admin/tables/%D9%85%D9%86%D8%AA%D8%AC%D8%A7%D8%AA/new
+  const to = tableUrl("منتجات", "/new");
   ```
+  `tableUrl(slug, suffix?, database?)` encodes the slug — and the database segment, defaulting to
+  the current route's `:database?` — with `encodeURI` per segment, then appends `suffix` untouched.
+- **Multi-database URLs:** the CMS pages live at `/{databaseSlug}/admin/…` when `database` is not
+  set in `.env` (§14). Per-table overrides written as above sit at `/admin/tables/{slug}`; with
+  `database` configured (recommended) that is the same URL the CMS uses, so the override applies.
+  Mirror the `[[database]]` folder in `app/pages/[[database]]/admin/…` only for pages you replace
+  wholesale — never for per-table screens.
 
 ### Example — ASCII slugs (hospital-style app)
 
-```ts
-{
-  name: "urgences",
-  path: "/admin/tables/urgences",
-  file: "~/pages/admin/tables/urgences/index.vue",
-},
-{
-  name: "traumatoA",
-  path: "/admin/tables/traumatoA",
-  file: "~/pages/admin/tables/traumatoA/index.vue",
-},
+```text
+app/pages/admin/tables/urgences/index.vue         →  /admin/tables/urgences
+app/pages/admin/tables/traumatoA/index.vue        →  /admin/tables/traumatoA
+app/pages/admin/tables/traumatoA/[id]/index.vue   →  /admin/tables/traumatoA/:id
 ```
 
 ### Example — Arabic slugs (commerce-style app)
 
-```ts
-{
-  name: "منتجات",                                         // /admin/tables/منتجات
-  path: "/admin/tables/منتجات",
-  file: "~/pages/admin/tables/منتجات/index.vue",
-},
-{
-  name: "desc-منتجات",                                    // nested detail: /admin/tables/منتجات/:id/desc
-  path: "/admin/tables/منتجات/:id/desc",
-  file: "~/pages/admin/tables/منتجات/[id]/desc.vue",
-},
-{
-  name: "منتجات-settings",
-  path: "/admin/tables/منتجات/settings",
-  file: "~/pages/admin/tables/منتجات/settings.vue",
-},
-{
-  name: "منتجات-new",
-  path: "/admin/tables/منتجات/new",
-  file: "~/pages/admin/tables/منتجات/new.vue",
-},
-{
-  name: "منتجات-flows",
-  path: "/admin/tables/منتجات/flows",
-  file: "~/pages/admin/tables/منتجات/flows.vue",
-},
-{
-  name: "مهام",
-  path: "/admin/tables/مهام",
-  file: "~/pages/admin/tables/مهام/index.vue",
-},
-{
-  name: "مهام-id",                                        // detail: /admin/tables/مهام/:id
-  path: "/admin/tables/مهام/:id",
-  file: "~/pages/admin/tables/مهام/[id]/index.vue",
-},
-{
-  name: "مهام-schedules",
-  path: "/admin/tables/مهام/schedules",
-  file: "~/pages/admin/tables/مهام/schedules.vue",
-},
-{
-  name: "طلبات الشراء",                                   // slugs may contain spaces
-  path: "/admin/tables/طلبات الشراء",
-  file: "~/pages/admin/tables/طلبات الشراء/index.vue",
-},
+```text
+app/pages/admin/tables/منتجات/index.vue → /admin/tables/منتجات        (grid)
+app/pages/admin/tables/منتجات/new.vue → /admin/tables/منتجات/new
+app/pages/admin/tables/منتجات/settings.vue → /admin/tables/منتجات/settings
+app/pages/admin/tables/منتجات/flows.vue → /admin/tables/منتجات/flows
+app/pages/admin/tables/منتجات/[id]/desc.vue → /admin/tables/منتجات/:id/desc   (extra screen of your own)
+app/pages/admin/tables/مهام/index.vue → /admin/tables/مهام
+app/pages/admin/tables/مهام/[id]/index.vue → /admin/tables/مهام/:id    (the grid's view button goes here)
+app/pages/admin/tables/مهام/schedules.vue → /admin/tables/مهام/schedules
+app/pages/admin/tables/طلبات الشراء/index.vue → /admin/tables/طلبات الشراء
 ```
+
+### Overriding a non-table CMS page
+
+Anything else the layer provides is replaced by creating a file at the **same path**:
+
+```text
+app/pages/[[database]]/admin/settings.vue   →  replaces the CMS database-settings page
+app/pages/[[database]]/auth/index.vue       →  replaces the login / signup page
+app/pages/[[database]]/admin/dashboards/index.vue
+```
+
+Nuxt matches layer and app pages by route path, so a same-path file wins and no `pages` array
+manipulation is needed.
 
 ---
 
@@ -1403,10 +1343,10 @@ export default defineNuxtConfig({
 5. **Plan** the app/pages against the real table slugs, field names and flows found in step 4.
 6. **Design structure when needed**: create/edit tables, schemas and flows via the meta endpoints
    (§10), following the canonical schema rules (§7.4); never create a second `users` table. Put
-   derived numbers in **computed fields** rather than computing them in the client (§8). Optionally
-   use the platform AI to draft schemas (§11) — it requires an admin session.
-7. **Implement** the app on the starter project (Nuxt layer pattern; register custom table pages in
-   `hooks["pages:extend"]` per §15; pages override CMS routes).
+   derived numbers in **computed fields** rather than computing them in the client (§8). When
+   working through a code agent, do all of this with the MCP server's tools (§11).
+7. **Implement** the app on the starter project (Nuxt layer pattern; custom table pages are just
+   files under `app/pages/admin/tables/<tableSlug>/…` per §15 — they override the CMS routes).
 8. **Aggregate server-side**: totals/counters go through `GET {db}/{table}/sum` (§5.6) — never by
    summing a paginated page of rows in the client.
 9. **Verify** your work by reading data back through the same API with the session id — and judge every
@@ -1426,13 +1366,15 @@ export default defineNuxtConfig({
   there is no separate `page`/`perPage`/`limit`/`columns` query param.
 - Never send a computed field's key in a create/update body, and never mix `computed` with
   `required`/`unique`/`regex` (§8).
-- Writing dashboards, backups, domains, database export and **every AI endpoint** need the super-admin
-  role (`idOne`); expect `accessDenied` otherwise (a real `403` on the AI routes, an error body
-  elsewhere). Reading dashboards only needs a session.
-- Custom table interfaces must be registered in `nuxt.config.ts` via `pages:extend` (§15).
+- Writing dashboards, backups, domains, database export need the super-admin role (`idOne`); expect
+  `accessDenied` otherwise (a real `403` on some routes, an error body elsewhere). Reading
+  dashboards only needs a session.
+- Custom table interfaces are **file-based**: put the page under `app/pages/admin/tables/<tableSlug>/`
+  (no `[[database]]` segment, no `pages:extend` hook) and link to it with `tableUrl()` so non-ASCII
+  slugs stay encoded (§15).
 - When editing a table's schema or flows, send the **full** lists (merge first) — a partial `schema`
   replaces the whole column set, a partial `onRequest`/`onResponse` replaces all flows (§7.4, §9.5).
-- Version: this context targets Nuxt 4 / Inicontent layer 1.0.7 on `inibase` 3.3+ (current generation).
+- Version: this context targets Nuxt 4 / Inicontent layer 1.1.0 on `inibase` 3.3+ (current generation).
 
 ---
 
@@ -1459,14 +1401,15 @@ export default defineNuxtConfig({
 | WebSocket closes with `4403` | the session is not allowed to read that table (`allowedMethods`/flows) |
 | `POST /assets/import` → `noStorageConfigured` | no S3/local storage configured for the deployment |
 | Import/export → `unsupportedFormat` | only `.csv` and `.json` are supported; send the file name via `x-import-file-name` (§5.8) |
-| AI endpoint → `accessDenied` | AI endpoints (and dashboard writes, backups, export, domains) require the DB owner/admin role (`idOne`) |
+| MCP tool → `accessDenied` | remember the bearer/<db>_sid must map to an **admin session** for dashboard writes, backups, export, domains (§11) |
 | `GET {db}/{table}/schema` → 404 | there is no GET on that path — read the schema from `GET inicontent/databases/{db}` (§10.1) |
 | `/auth/signup` → 404 | signup is `POST {db}/users` (the in-app auth docs page is out of date) (§3.4) |
-| Custom table page 404s | route not registered in `hooks["pages:extend"]` (§15) or `name` duplicated |
+| Custom table page 404s / CMS screen still shows | the file must be at `app/pages/admin/tables/<tableSlug>/index.vue` — folder name exactly the table slug, **no** `[[database]]` segment, not at the repo root (§15) |
+| Custom item page never opened by the CMS | the grid's *view* button only navigates to your page when `app/pages/admin/tables/<slug>/[id]/index.vue` exists; otherwise it falls back to the view drawer (§15) |
 | Table update wiped some fields | the `schema` PUT replaces the whole field list — merge existing fields first (§7.4) |
 | Schema PUT returned 200 but nothing changed | the table is `users`, `pages` or `blocks` and the new schema dropped a built-in key (`username`/`email`/`password`/`role`/`createdBy`, `slug`/`content`/`seo`, `name`/`config`/`hideOn`) — the update is silently skipped (§10.1) |
 | Flow rule seems ignored | a false condition aborts the flow; `[null,null,null]` is a no-op; check field ids/keys against the schema (§9); super-admin sessions bypass flows entirely |
-| Arabic/spaced slugs 404 | push entries verbatim — do not URL-encode the `path`/`name`; encode only when navigating via links |
+| Arabic/spaced slugs 404 | name the **folder** with the raw slug (no encoding), but encode the segment when you build links — use `tableUrl(slug, suffix)` from `useTableUrl()`; the router registers static pages under the percent-encoded spelling (§15) |
 | Port 3434 already in use | `pnpm dev` binds 3434 by design (INIc binary); stop the other process |
 | Session cookie missing in the browser | the SPA stores `{db}_sid` per database; check that cookie on API calls from `$fetch` |
 
@@ -1513,20 +1456,9 @@ Email        POST {apiBase}inicontent/databases/{db}/email/{test|preview}
 
 Dashboards   GET/POST {apiBase}{db}/dashboards  ·  PUT/DELETE {apiBase}{db}/dashboards/{id}
 
-AI (all admin-only, propose → apply)
-  route      POST {apiBase}{db}/ai                     {message,responseID?}         → redirect target
-  tables     POST {apiBase}{db}/ai/tables              {message,existingTables?}      → tables_approval_pending
-             PUT  {apiBase}{db}/ai/tables              {tables:[{slug,schema}]}      → {results,tables}
-             DELETE {apiBase}{db}/ai/tables            {tables:[slug]}               → {results}
-  data       POST {apiBase}{db}/ai/data                {message,existingTables?}      → data_approval_pending
-             PUT  {apiBase}{db}/ai/data                {items:[{table,records}]}     → {results}
-  content    POST {apiBase}{db}/ai/content             {table,count,topic,step,…}    → outline_ready|content_approval_pending
-  dashboards POST {apiBase}{db}/ai/dashboards          {message,existingTables?}      → dashboards_approval_pending
-             PUT  {apiBase}{db}/ai/dashboards          {dashboards:[…]}              → {results,dashboards}
-             DELETE {apiBase}{db}/ai/dashboards        {ids:[…]}                     → {results}
-  pages      POST {apiBase}{db}/ai/pages               {message,slugPrefix?}         → structure_generated
-  translate  POST/PUT {apiBase}{db}/ai/translate       {message} / {items}           → translation_approval_pending
-  databases  POST {apiBase}{db}/ai/databases           {message}                     → database_approval_pending
+MCP server   stdio: `inicontent-mcp`  ·  HTTP: `inicontent-mcp http` → http://127.0.0.1:3000/mcp
+             bearer `Authorization: Bearer <db>:<sessionID>` (mint with `login --print-token`)
+             tools & context resources listed in §11 (no `/ai` endpoints exist anymore)
 
 Computed expression cheatsheet (ids, not keys — see §8)
   sum(count|avg|min|max)(expr)   iterate an array-of-objects column, per element

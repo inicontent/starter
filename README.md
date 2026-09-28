@@ -14,8 +14,9 @@ installed from the `inicontent` npm package. It gives you, out of the box:
 - **Backups & restore** (full or per-table, with scoped restore), **database export**,
   and **SEO artifacts** (`sitemap.xml`, `feed.xml`, `robots.txt`, JSON-LD) derived from a
   per-table `config.content` declaration.
-- **AI assistant endpoints** under `{databaseSlug}/ai/*` that draft schemas, data, translations,
-  pages, dashboards and long-form content for you to review and apply.
+- **Agent access via MCP** — attach ChatGPT, Claude, Cursor or any code agent through
+  `@inicontent/mcp` (§11 of `CONTEXT.md`); it replaces the old in-app AI assistant and chatbot,
+  and its `create_project` tool scaffolds this very repo for a database.
 - A place for your own pages under `pages/` that **override** the CMS routes.
 - **[`CONTEXT.md`](CONTEXT.md)** — the AI-agent build context: authentication, REST API,
   query language, table schemas & flows, computed fields, dashboards, realtime, and how to
@@ -112,11 +113,12 @@ bun run preview
 
 - The CMS layer comes from the `inicontent` npm package; `package.json` pins the version
   (e.g. `^1.0.0`), and `pnpm up inicontent` pulls newer releases.
-- **Remove `app.vue`** — the layer provides its own.
-- Add your own files under `pages/`: they **override** the CMS routes of the same name.
-- Per-table screens are **not auto-discovered** from `pages/` — register every custom table route
-  explicitly in `nuxt.config.ts` via `hooks["pages:extend"]` (see `CONTEXT.md` §15).
+- **Remove `app/app.vue`** — the layer provides its own.
+- Add your own files under `app/pages/`: they **override** the CMS routes of the same name.
+- Per-table screens work the same way: drop a page at `app/pages/admin/tables/<tableSlug>/…`
+  (folder name = the table slug) and it replaces that CMS screen — no route registration, no
+  `nuxt.config.ts` hook (see `CONTEXT.md` §15).
 - Reusable code goes in `components/`, `composables/`, `layouts/` as in any Nuxt app.
 - **Read [`CONTEXT.md`](CONTEXT.md) before building** — it documents authentication, the REST API,
-  the Inison query language, table schemas, flows, and the route-registration rules the AI and
-  developers must follow.
+  the Inison query language, table schemas, flows, the route-override rules, and the MCP server
+  (§11) that connects code agents to the database.
