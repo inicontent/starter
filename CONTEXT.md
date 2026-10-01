@@ -412,17 +412,36 @@ Response (`code: 200`):
 
 Assets live in the `assets` table; other tables reference them with `type: "table", table: "assets"`.
 
-**Step 1 — Describe the file(s):**
+**The record shape** — an asset row is:
+```ts
+type Asset = Item & {
+  name: string;        // the name WITHOUT its extension
+  type: string;        // the MIME type for a file, or the literal "dir" for a folder
+  extension: string;   // "png", "jpg"… — empty for a folder
+  size: number;
+  publicURL: string;   // empty/absent for a folder
+};
+```
+> `type` does double duty: a **folder is an ordinary asset row with `type: "dir"`**, not a separate
+> resource. There is no `folders` table and no folder endpoint. A file's display name is always
+> `name + "." + extension` (the CMS renders them separately, so `name` never carries the extension).
+
+#### 5.7.1 Upload (step 1 — describe the file)
+
 ```
 POST {apiBase}{db}/assets                    // single file
 POST {apiBase}{db}/assets/{folder}           // into a folder
-Body: [ { "name": "logo.png", "size": 204800, "type": "image/png", "extension": "png" } ]
+Body: [ { "name": "logo", "size": 204800, "type": "image/png", "extension": "png" } ]
 ```
 Each object requires `name`, `size`, `type` (MIME) and `extension`. Arrays are supported for multiple files at once.
 
+> Send `name` **without** the extension — `"logo"`, not `"logo.png"` — since `extension` is its own field
+> (the CMS splits the browser's `File.name` on the last dot before sending).
+
 **Response:** the API returns the same fields **plus** `id`, `createdAt`, `publicURL`, and — crucially — **`uploadURL`**.
 
-**Step 2 — Upload the binary to the returned `uploadURL`:**
+#### 5.7.2 Upload (step 2 — send the binary)
+
 ```
 POST <uploadURL>          // or PUT when the URL contains "s3"
 Header: Content-Type: <mimeType>
@@ -438,13 +457,95 @@ After this the file is stored and reachable via `publicURL`.
 > **Cleanup:** if no `uploadURL` comes back unexpectedly, delete the just-created record:
 > `DELETE {apiBase}{db}/assets/{id}`.
 
-**Import by URL** (server-side fetch; needs S3 or local storage configured, else `noStorageConfigured`):
+#### 5.7.3 Import by URL (server-side fetch)
+
+Needs S3 or local storage configured, else `noStorageConfigured`:
 ```
 POST {apiBase}{db}/assets/import          // also /assets/import/{folder}
 Body: [ "https://example.com/logo.png", "https://example.com/hero.jpg" ]
 ```
 The server creates the `assets` rows (and returns `uploadURL`/`publicURL` when the target storage needs a
 client-side upload).
+
+#### 5.7.4 Folders
+
+A folder path is a plain slash-joined string appended to `/assets`, at any depth:
+`/assets`, `/assets/logos`, `/assets/logos/2026`.
+
+**Create a folder = POST to the folder path with no body at all** (no `name`/`size`/`type`):
+```
+POST {apiBase}{db}/assets/logos/2026        // empty body → creates the "2026" folder inside "logos"
+```
+It throws if the folder already exists, so create parents before children and treat "already exists" as success.
+This is the only way to make a folder — the body documented in §5.7.1 always creates a *file* row.
+
+**Read the assets table** (the reference for all of the above):
+```
+GET {apiBase}{db}/assets[/{folder}]
+```
+This is an ordinary list endpoint: it accepts `options` / `where` / `locale` (§5.1, §6) and returns
+`options.total` / `options.totalPages` for pagination. It returns **direct children only** — one level,
+never a recursive or flattened tree.
+
+> **Recursion is the caller's job.** To walk a whole tree, request one path, then for every row with
+> `type === "dir"` request `/assets/{that name}` and repeat. That is one request per directory (the CMS
+> pages at `perPage: 500` while doing it), so budget accordingly on deep trees.
+
+#### 5.7.5 Rename
+
+```
+POST {apiBase}{db}/assets/rename/{parent folders…}/{id}
+Body: { "name": "new-name" }
+```
+Returns the updated asset (`200`).
+
+- **The full parent path is mandatory** — the caller must know every ancestor folder *name*, exactly as for
+  `GET /assets/{path}`. The asset id alone is not addressable: each parent segment is resolved to a folder id
+  (404 on a wrong or incomplete chain), and the target lookup is scoped to that resolved chain, so an id
+  belonging to a different folder will not match.
+- The action segment is `rename`, placed **before** the path. A trailing segment (`/assets/{path}/{id}/rename`)
+  compiles to `**:path/rename`, which radix3 cannot match — the path is swallowed and the request silently
+  falls through to the assets catch-all. Keep the wildcard terminal, like `assets/import/{path}`.
+- Renaming is gated on the `assets` table's `allowedMethods` containing `u` — the same permission the CMS
+  checks before offering the action — and answers `accessDenied` otherwise.
+- The endpoint renames the row **and moves the stored object server-side** (S3 copy, or copy+delete for
+  local storage), then recomputes `publicURL`. There is no re-upload step and no window in which
+  `publicURL` points at a missing object. `extension` is not renameable — it is a separate field, and a
+  folder's `extension` stays `dir`.
+- `name` is a single path segment. An empty name or one containing `/` is rejected: `missingName` /
+  `invalidName`. An unchanged name is a `200` no-op. Duplicate names are allowed, as on upload.
+- A failed storage move leaves the row and its `publicURL` untouched: `renameFailed`. A leftover old object
+  after a successful move is an orphan, not data loss.
+- Renaming a **folder needs no cascade** — the hierarchy is stored as an array of ancestor folder **ids**,
+  not names, so children are unaffected. Existing links to `/assets/{old folder name}/…` stop resolving
+  under the new name.
+- There is **no move** (rename in place instead) and no copy.
+
+> **Do not rename via the ordinary item update.** `PUT {db}/assets` with a changed `name`/`extension` is the
+> *replace* flow: it deletes the old stored object, returns a fresh `uploadURL`, and expects the client to
+> re-upload the binary — and it only repoints `publicURL` when it is empty or an `s3://`/`local://`
+> placeholder. Ignoring the returned `uploadURL` leaves the row pointing at a deleted object. Use
+> `POST /assets/rename/{path}/{id}` instead.
+
+#### 5.7.6 Delete
+
+Files and folders are addressed differently in the path — a file by its `id`, a folder by its `name`:
+```
+DELETE {apiBase}{db}/assets/{id}                    // a file
+DELETE {apiBase}{db}/assets/{folder}/{folderName}   // a folder (by name, not id)
+```
+
+#### 5.7.7 Auth & params
+
+Every assets request needs the session (§3.2) and accepts `locale`:
+```
+GET|POST|PUT|DELETE {apiBase}{db}/assets…?{db}_sid=<sessionID>&locale=<ar|en|fr|es>
+```
+Send the session as a cookie (`credentials: "include"`) or as the `{db}_sid` query param, and respect the
+`assets` table's `allowedMethods` — the CMS only offers rename when `u` is granted and delete when `d` is.
+
+> **Not covered by database export:** `POST {apiBase}inicontent/databases/{db}/export` archives schemas and
+> records but **not the asset files** (§10.3). Storage usage/quota is only surfaced on `/admin/billing` (§14).
 
 ### 5.8 Table sub-resources
 
@@ -1442,6 +1543,10 @@ Schedules    GET/POST {apiBase}{db}/{table}/schedules  ·  POST .../schedules/pr
              PUT/DELETE .../schedules/{id}  ·  POST .../schedules/{id}/run
 Assets       POST {apiBase}{db}/assets  →  response.uploadURL  →  POST/PUT binary to uploadURL
 Assets by URL POST {apiBase}{db}/assets/import               ["https://…"]
+Asset folder POST {apiBase}{db}/assets/{folder}              (empty body → create folder; §5.7.4)
+Asset read   GET  {apiBase}{db}/assets[/{folder}]            direct children only; options/where/locale
+Asset rename POST {apiBase}{db}/assets/rename/{path}/{id}     {name} — moves the object, no re-upload (§5.7.5)
+Asset delete DELETE {apiBase}{db}/assets/{id}                 file by id · folder by .../{folder}/{name}
 Backups      GET/POST {apiBase}{db}/backups  ·  POST .../backups/{id}/restore {scope,confirm:true}
 SEO          GET  {apiBase}{db}/seo/{sitemap.xml|robots.txt|feed.xml|schema.json}
 Realtime     wss://{apiHost}/realtime  →  {"type":"subscribe","database","table"}
