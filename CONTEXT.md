@@ -194,6 +194,35 @@ Use this as a cheap "is my session alive?" check.
 > The in-app API docs page (`/admin/api/auth`) advertises a `POST /auth/signup` path. **No such route exists** —
 > signup is a `users` table create (`POST {db}/users`), which the built-in users flows gate.
 
+### 3.5 Platform sessions (`inicontent_sid`) — the second session scope
+
+The platform is not a separate auth system: `routes/inicontent/auth/signin` **is** the tenant
+sign-in handler mounted at the `inicontent` segment. So the platform is just another "database"
+name, and signing in to it yields a second, independent session scope.
+
+```bash
+# Platform sign-in — the account that owns/creates databases
+curl -s -X PUT "https://api.inicontent.com/inicontent/auth/signin?locale=en" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"…","password":"…"}'
+# → capture result.sessionID as $PLATFORM_SID
+```
+
+| Scope | Session param | Signs in via | Reaches |
+| --- | --- | --- | --- |
+| **Tenant / database** | `{db}_sid=<sessionID>` | `PUT {db}/auth/signin` (§3.1) | one database — everything in §3.1–§3.4 and §5 |
+| **Platform** | `inicontent_sid=<sessionID>` | `PUT inicontent/auth/signin` | `inicontent/*` — database create (§10.8), billing, domains |
+
+Verify it with `GET {apiBase}inicontent/auth/current?inicontent_sid=<sessionID>` (§3.3, same handler).
+
+The platform sign-in response is **flat** — `sessionID` sits at the top of `result`, next to
+`id`, `username`, `email`, `role` and `hasPasskey`; there is no nested `user` object. Its `code` is
+the **string** `loginSuccess`, and the body echoes a hashed `password`: treat the whole response as
+a secret and never log it.
+
+> **Creating a database needs the platform session**, not a `{db}_sid` — see §10.8. Everything
+> else in this document is tenant-scoped, and the layer's own UI only ever holds a `{db}_sid`.
+
 ---
 
 ## 4. Database discovery (the AI agent's map of the data)
@@ -335,10 +364,15 @@ engine's page info (`page`, `perPage`, `total`, and `totalPages`).
 > { "result": null, "message": "The database does not exist",
 >   "code": "dbNotFound", "options": { "page": 1, "perPage": 15 } }
 > ```
-> On failure `code` is the **error-code string** (e.g. `dbNotFound`, `accessDenied`, `notFound`,
-> `tableNotFound`, `COMPUTED_FIELD_SETTABLE`), `message` is its human-readable (localized) text, and
-> `result` is `null`. On success `code` is a **number** (`200`, `201`, `202`, `204`).
-> So: treat `result === null` (or a non-numeric `code`) as the failure signal.
+> On failure `message` is the human-readable (localized) text and `result` is `null`. On success
+> `result` is populated.
+>
+> **Judge by `result`, not by `code`.** `result === null` is the *only* reliable failure signal. The
+> type of `code` is not a shortcut: a successful sign-in answers `code: "loginSuccess"` (a
+> **string**), and an account that owns no databases answers `code: 404` (a **number**) with
+> `result: null` (§10.8). Numeric success codes are `200` / `201` / `202` / `204`, and failure codes
+> are otherwise arbitrary — `dbNotFound`, `accessDenied`, `notFound`, `tableNotFound`,
+> `noActiveSubscription`, `emptyBody`, `databaseExist`, `tableExist`, `COMPUTED_FIELD_SETTABLE`, ….
 >
 > A few routes — schema validation — throw instead and answer with a **real HTTP
 > status** (`401 authRequired`, `403 accessDenied`, `400 emptyBody`). Handle both shapes.
@@ -629,7 +663,7 @@ const options = Inison.stringify({
 
 A table's structure is its **schema** — a `Schema` (that is `Field[]`). Read it from the DB
 metadata (§4, `tables[*].schema`). You create/edit it with the **meta endpoints** (§10), or let the
-platform AI design it (§11.3) using the rules below (§7.5).
+platform AI design it (§11.3) using the rules below (§7.4).
 
 ### 7.1 The `Field` object
 
@@ -717,12 +751,18 @@ These are the conventions the platform itself uses — an agent connected throug
 2. **`users` is a built-in system table.** Never propose a new users-equivalent table in any
    language (`users`, `utilisateurs`, `مستعملين`, `users_ar`, `customer_users`…). Reuse the
    `users` slug; if extra user fields are needed, **edit** the existing `users` table (keep its
-   fields, add only what's missing). Use `label` for localized display text.
-3. Audit fields `createdBy` / `updatedBy` → `{ type: "table", table: "users" }`.
-4. New tables: `isNew: true`; edits: `isNew: false`.
-5. Icons are **Tabler icon names** normalized to kebab-case (`building-store`) — tabler.io/icons.
-6. Use the DB's **primary language** for table slugs, field keys, role names and labels.
-7. Add a `label` on tables/fields when the app is multilingual; it is translated through the
+   fields, add only what's missing). Use `label` for localized display text (§7.6).
+3. **Never create per-locale columns.** Do not add suffixed fields like `title_en`, `title_fr`,
+   `content_ar`. Multilingual content lives in the system `translations` table (§7.6): define
+   single keys (`title`, `content`) and read them back with `?locale=<code>`.
+4. Audit fields `createdBy` / `updatedBy` → `{ type: "table", table: "users" }`.
+5. **Never send `id` — and there is no `isNew` param.** The server assigns `id` itself
+   (`max(existing ids) + 1`) on table create. Keep the ids the create response returns: it echoes
+   the engine-normalized schema, and those field ids are what computed expressions (§8.2) and flow
+   rules (§9) reference.
+6. Icons are **Tabler icon names** normalized to kebab-case (`building-store`) — tabler.io/icons.
+7. Use the DB's **primary language** for table slugs, field keys, role names and labels.
+8. Add a `label` on tables/fields when the app is multilingual; it is translated through the
    `translations` table, not by renaming keys.
 
 ### 7.5 Example — the default `users` table (real source)
@@ -740,6 +780,54 @@ These are the conventions the platform itself uses — an agent connected throug
 (Default roles: 1 = admin, 2 = user, 3 = guest. The built-in flows use field ids: `@user.4`
 = role, `@data.2` = password, `@data.5` = createdBy. `config` is a free JSON column for
 per-user preferences.)
+
+---
+
+### 7.6 Translations (multilingual content)
+
+The platform stores multilingual content in the **system `translations` table**, not as per-locale columns on the source table.
+
+**Correct pattern (single source fields):**
+```json
+{
+  "schema": [
+    { "key": "title", "type": "string", "required": true },
+    { "key": "content", "type": "html" }
+  ]
+}
+```
+
+Fetch translated content by passing the `locale` query param (as documented in §5.1):  
+`GET {apiBase}{db}/{table}?locale=fr&options={page:1,perPage:10}` merges translations for translatable fields into the returned items.
+
+**Incorrect anti-pattern (do not do this):**
+```json
+{ "key": "title_en", "type": "string" },
+{ "key": "title_fr", "type": "string" },
+{ "key": "content_en", "type": "html" },
+{ "key": "content_fr", "type": "html" }
+```
+
+**Notes:**
+- Translatable fields generally include `string`, `text`, `textarea`, `html`, `url`, `table`, `asset`, and array forms of references (see `isTranslatableField()` in the layer). Fields like `password`, `email`, `color`, `icon`, `link`, `role`, `ids`, `id`, and similar identifiers are not translatable.
+- Table and field `label`s are also translated via the `translations` table (rule 8 in §7.4).
+- The Translate drawer in the admin UI manages per-item translations; programmatic access uses the `translations` table directly if needed.
+
+**The `translations` row shape** (seeded by the API; `table`/`field`/`item` are the key):
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `original` | `string` | the source-language value |
+| `translation` | `string` | **required** — the translated value |
+| `locale` | `string` (`subType: "locale"`) | **required** — `ar` / `en` / `fr` / `es` |
+| `table` | `id` | **encoded** table id, not the slug |
+| `field` | `number` | the field **id**, not the key |
+| `item` | `string` \| `number` | the item id |
+| `createdBy` | `table` → `users` | **required** |
+
+> `table` and `field` are ids, not slugs/keys — read them from `GET inicontent/databases/{db}`
+> (§4) and from the normalized schema a table create/update returns (§7.4 rule 5). `translations`
+> also backs table and field `label`s, so a label row has `field` set and no `item`.
 
 ---
 
@@ -1069,7 +1157,7 @@ POST   {apiBase}{db}/dashboards            # { name, description?, icon?, widget
 PUT    {apiBase}{db}/dashboards/{id}       # same body
 DELETE {apiBase}{db}/dashboards/{id}
 ```
-The AI equivalents are in §11.6. Widget structure is in §12.2.
+The AI equivalents are the `inicontent_dashboard_*` tools listed in §11.1. Widget structure is in §12.2.
 
 ### 10.5 Backups & restore
 
@@ -1106,6 +1194,58 @@ GET {apiBase}{db}/seo/schema.json
 These return **raw** `application/xml` / `text/plain` documents (not the JSON envelope), derived from
 each table's `config.content` declaration (§4.2), and records are read **through the table's
 `onRequest` flow** — a draft hidden from anonymous visitors is never advertised.
+
+### 10.8 Creating a database (first run)
+
+This is the one operation that needs the **platform** session scope (§3.5), and the only one that
+happens *before* a tenant database — and therefore a `{db}_sid` — exists.
+
+```bash
+# 1) Platform sign-in — the account that owns/creates databases
+curl -s -X PUT "https://api.inicontent.com/inicontent/auth/signin?locale=en" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"…","password":"…"}'
+# → capture result.sessionID as $PLATFORM_SID
+
+# 2) Create the database. A body is required (an empty one is rejected), but every
+#    field in it is optional.
+curl -s -X POST "https://api.inicontent.com/inicontent/databases/myapp?locale=en&inicontent_sid=$PLATFORM_SID" \
+  -H 'Content-Type: application/json' -d '{}'
+
+# 3) Sign in to the new database with the admin user the create seeded
+curl -s -X PUT "https://api.inicontent.com/myapp/auth/signin?locale=en" \
+  -H 'Content-Type: application/json' -d '{"username":"…","password":"…"}'
+
+# 4) Confirm it — discovers tables, schemas, roles
+curl -s "https://api.inicontent.com/inicontent/databases/myapp?myapp_sid=<sid>"
+```
+
+**The admin user is inherited from the platform session, not sent in the body.** The create handler
+posts `{ username, password, email }` from the *signed-in platform user* into the new database's
+`users` table with `role: 1` (admin), then opens a session for it and sets the `{db}_sid` cookie.
+So step 3 reuses the same credentials as step 1.
+
+The optional body accepts:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `roles` | `string[]` | extra role **names**. `admin` / `user` / `guest` are seeded as ids `1`/`2`/`3`; extras start at `4` |
+| `tables` | `{ id?, slug, schema, config? }[]` | tables to create alongside the system ones. Omit `id` (§7.4 rule 5); `slug`s that collide with a system table are dropped |
+
+`slug` comes from the path, not the body. On success the response is `code: 201` with the new
+database, its `tables` filtered to those with `allowedMethods`, and the system tables from §1 now
+present — `users`, `sessions`, `assets`, `translations`, `pages`, `blocks`, `dashboards`,
+`passkey_credentials`, `passkey_challenges`, `templates`, `backups`.
+
+| Failure | Meaning |
+| --- | --- |
+| `emptyBody` | no body sent — send at least `{}` |
+| `noActiveSubscription` | the account has no active paid plan. The platform **super-admin** (`idOne`) bypasses this check; everyone else needs a live subscription |
+| `databaseExist` | a database with that slug already exists |
+
+> `GET {apiBase}inicontent/databases?inicontent_sid=…` lists the account's databases, but it shifts
+> off the platform's own meta row and answers `result: null`, `code: 404` when the account owns
+> **none**. That `404` is a success-shaped envelope, not a missing route.
 
 ---
 
@@ -1157,7 +1297,7 @@ inicontent-mcp login --username ada --password '…' --database myapp --print-to
 ### 11.2 What "full API access" means
 
 Every tool maps 1:1 to the REST API in this document and honours the same rules: the response
-envelope of §5.1 (numeric `code` = success, string `code` = failure), `{db}_sid` on data requests,
+envelope of §5.1 (`result: null` = failure, whatever `code` says), `{db}_sid` on data requests,
 `allowedMethods`/`show` enforcement, and the admin-only gates on dashboard writes, backups, export
 and domains. A session that dies mid-conversation is silently re-signed-in once when credentials
 are configured.
@@ -1505,6 +1645,14 @@ manipulation is needed.
 | MCP tool → `accessDenied` | remember the bearer/<db>_sid must map to an **admin session** for dashboard writes, backups, export, domains (§11) |
 | `GET {db}/{table}/schema` → 404 | there is no GET on that path — read the schema from `GET inicontent/databases/{db}` (§10.1) |
 | `/auth/signup` → 404 | signup is `POST {db}/users` (the in-app auth docs page is out of date) (§3.4) |
+| A *successful* sign-in has a string `code` | `code: "loginSuccess"` — judge by `result`, not by `code` (§5.1) |
+| `POST inicontent/databases/{slug}` → `emptyBody` | a body is required even though every field is optional — send at least `{}` (§10.8) |
+| `POST inicontent/databases/{slug}` → `noActiveSubscription` | the account has no active paid plan; only the platform super-admin (`idOne`) bypasses this (§10.8) |
+| `POST inicontent/databases/{slug}` → `databaseExist` | that slug is taken — pick another, or `DELETE` the old database first |
+| Tenant call answers `accessDenied` on `inicontent/*` | you sent a `{db}_sid`; platform routes need `inicontent_sid` from `PUT inicontent/auth/signin` (§3.5) |
+| `GET inicontent/databases` → `code: 404` | the account owns no databases — the route shifts off the platform meta row, so an empty list is a `404` body (§10.8) |
+| New database's admin can't sign in | the admin user is seeded from the **platform** session's username/password/email — reuse the same credentials, the body cannot set them (§10.8) |
+| Sent `isNew: true` on a table create and nothing happened | there is no such param; it is stored as junk on the table record. Omit `id` and let the server assign it (§7.4 rule 5) |
 | Custom table page 404s / CMS screen still shows | the file must be at `app/pages/admin/tables/<tableSlug>/index.vue` — folder name exactly the table slug, **no** `[[database]]` segment, not at the repo root (§15) |
 | Custom item page never opened by the CMS | the grid's *view* button only navigates to your page when `app/pages/admin/tables/<slug>/[id]/index.vue` exists; otherwise it falls back to the view drawer (§15) |
 | Table update wiped some fields | the `schema` PUT replaces the whole field list — merge existing fields first (§7.4) |
@@ -1530,7 +1678,6 @@ Sign in      PUT  {apiBase}{db}/auth/signin                 {username,password}
 Sign out     GET  {apiBase}{db}/auth/signout
 Current      GET  {apiBase}{db}/auth/current                {db}_sid=<sid>
 DB metadata  GET  {apiBase}inicontent/databases/{db}        {db}_sid=<sid>
-DB list      GET  {apiBase}inicontent/databases
 List         GET  {apiBase}{db}/{table}?options={page,perPage,columns,sort}&where={...}&locale&{db}_sid
 One          GET  {apiBase}{db}/{table}/{id}
 Sum          GET  {apiBase}{db}/{table}/sum?columns=<col|nested.path>&nested=true&where={...}
@@ -1558,6 +1705,12 @@ Item schema  POST/PUT {apiBase}{db}/{table}/schema            (no GET)
 DB export    POST/GET {apiBase}inicontent/databases/{db}/export  ·  GET .../export/download
 Domains      POST {apiBase}inicontent/databases/{db}/domains   {domainName}  ·  GET/DELETE .../domains/{name}
 Email        POST {apiBase}inicontent/databases/{db}/email/{test|preview}
+
+— platform scope (inicontent_sid, NOT {db}_sid — §3.5) —
+Platform in  PUT  {apiBase}inicontent/auth/signin             {username,password} → code "loginSuccess"
+Platform who GET  {apiBase}inicontent/auth/current            inicontent_sid=<sid>
+Create DB    POST {apiBase}inicontent/databases/{slug}         body required ({} ok) {roles?,tables?} → code 201
+DB list      GET  {apiBase}inicontent/databases               inicontent_sid=<sid> — 404 body when empty
 
 Dashboards   GET/POST {apiBase}{db}/dashboards  ·  PUT/DELETE {apiBase}{db}/dashboards/{id}
 

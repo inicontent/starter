@@ -10,7 +10,8 @@ page, which is out of date.
 
 | You are doing… | Read |
 | --- | --- |
-| Authenticating / calling the API | §3 Auth, §5 REST API, §6 Query language |
+| Authenticating / calling the API | §3 Auth (incl. §3.5 platform sessions), §5 REST API, §6 Query language |
+| **Creating a new database** | §10.8 first run, §3.5 platform sessions (`inicontent_sid`) |
 | Reading or changing a schema | §4 Database discovery, §7 Schema & field types, §10 Meta endpoints |
 | Totals, derived numbers, line totals | §8 Computed fields |
 | Automating data (validation, defaults, emails) | §9 Flows |
@@ -24,11 +25,20 @@ page, which is out of date.
 - **Never invent API params.** The only query params that carry pagination, projection and sorting
   are `options` and `where`, both **Inison-stringified and URL-encoded** (`CONTEXT.md` §5.1/§6).
   The default `perPage` is **15**. There is no top-level `page` / `limit` / `columns` / `search` param.
-- **Errors arrive with HTTP 200.** Judge every response by its body: `result: null` plus a **string**
-  `code` (`dbNotFound`, `accessDenied`, `COMPUTED_FIELD_SETTABLE`, …) means failure; a numeric `code`
-  (`200`/`201`/`202`/`204`) means success. A few validation routes do use real 401/403.
+- **Errors arrive with HTTP 200 — judge by `result`, not by `code`.** `result: null` is the only
+  reliable failure signal. Do **not** use the type of `code` as a shortcut: a successful sign-in
+  answers `code: "loginSuccess"` (a string) and an account owning no databases answers `code: 404`
+  (a number) with `result: null` (`CONTEXT.md` §5.1).
+- **Never send `id` — and there is no `isNew` param — when creating a table.** The server assigns
+  `id = max(existing ids) + 1`. Keep the ids the create response returns; they are what computed
+  expressions and flow rules reference (`CONTEXT.md` §7.4 rule 5).
 - **Ask the user** for the database slug, username and password. Never invent them, never hardcode
   them, never print or log them — use env vars.
+- **Two session scopes.** `{db}_sid` authenticates one tenant database; `inicontent_sid` authenticates
+  the platform. Creating a database requires the platform session, not a `{db}_sid`
+  (`CONTEXT.md` §3.5, §10.8).
+- **Role ids are opaque.** Read them from `GET inicontent/databases/{db}` → `roles[].id`; never
+  hardcode `1`/`2`/`3` or a hex id (`CONTEXT.md` §4, §7.5).
 - **Never send a computed field's key in a create/update body.** Computed values are engine-owned
   and read-only (`CONTEXT.md` §8).
 - **Schema, `onRequest` and `onResponse` replace wholesale.** Always read the current table first
@@ -41,6 +51,7 @@ page, which is out of date.
 - **Respect `allowedMethods` (`r`/`c`/`u`/`d`) and `show`** per table, and the DB super-admin
   requirement on dashboards writes, backups, export and domains.
 - **Never propose a second `users` table** — edit the existing one (`CONTEXT.md` §7.4).
+- **Never create per-locale columns.** Do not add suffixed fields like `title_en`, `title_fr`, `content_ar`. Multilingual content uses the system **`translations` table** (keyed by table/item/field/locale). Define schema with single keys (e.g., `title`, `content`) and fetch with `?locale=<code>` (§5.1, §7.6).
 
 ## Project shape
 
