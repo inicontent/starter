@@ -1,0 +1,15 @@
+[data-block="Notice"] .notice {
+	border: 1px solid currentColor;
+	border-radius: 8px;
+	padding: 12px 16px;
+}
+
+[data-block="Notice"] .notice[data-tone="warning"] {
+	border-color: #b45309;
+	background: #fffbeb;
+}
+
+[data-block="Notice"] .notice[data-tone="error"] {
+	border-color: #b91c1c;
+	background: #fef2f2;
+}
